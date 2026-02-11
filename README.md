@@ -1,26 +1,26 @@
 # LUMINA-ML: Spectral Emulator & Bayesian Inference for SN Ia
 
-LUMINA-SN Monte Carlo 복사전달 코드의 ML 기반 스펙트럼 에뮬레이터 및 베이지안 역문제 풀이 파이프라인.
+ML-based spectral emulator and Bayesian inverse-problem pipeline for the LUMINA-SN Monte Carlo radiative transfer code.
 
 ## Overview
 
-SN 2011fe (Type Ia 초신성)의 관측 스펙트럼에서 물리적 파라미터를 추정하기 위한 3단계 재귀적 피팅 시스템:
+A 3-stage recursive fitting system to estimate physical parameters from the observed spectrum of SN 2011fe (Type Ia supernova):
 
 ```
                     Stage 1                    Stage 2                    Stage 3
               ┌─────────────────┐       ┌─────────────────┐       ┌─────────────────┐
-  관측 ──────>│ 15D 글로벌 탐색  │──────>│ 6존 조성 세분화  │──────>│ 15존 조성 세분화 │──> 최종 모델
-  스펙트럼    │  LHS → MLP → MCMC│ ±10%  │ LHS → MLP → MCMC│ ±10%  │ LHS → MLP → MCMC│
+  Observed ──>│ 15D Global Search│──────>│ 6-Zone Comp.    │──────>│ 15-Zone Comp.   │──> Final Model
+  Spectrum    │  LHS → MLP → MCMC│ ±10%  │ LHS → MLP → MCMC│ ±10%  │ LHS → MLP → MCMC│
               └─────────────────┘ relax └─────────────────┘ relax └─────────────────┘
 ```
 
-각 단계의 결과가 다음 단계의 초기 범위로 전달되며, **±10% 여유**를 둬서 이전 단계의 local minimum에 갇히지 않도록 합니다.
+Each stage passes its best-fit results to the next stage with **±10% relaxation**, preventing the search from being trapped in a local minimum.
 
 ## 3-Stage Recursive Fitting
 
 ### Stage 1: Global Parameters (15D)
 
-밀도 구조, 속도, 광도 등 거시적 물리량을 탐색합니다.
+Explores macroscopic physical quantities: density structure, velocity boundaries, and luminosity.
 
 | Parameter | Description | Range |
 |-----------|-------------|-------|
@@ -40,15 +40,15 @@ SN 2011fe (Type Ia 초신성)의 관측 스펙트럼에서 물리적 파라미�
 | `X_Ni` | Initial Ni56 fraction (all zones) | 0.005 -- 0.25 |
 | `X_Fe_outer` | Fe mass fraction (outer) | 0.001 -- 0.15 |
 
-- 밀도 모델: **Broken power-law** (v < v_break: exp_inner, v >= v_break: exp_outer)
-- 조성 모델: **3-zone** (Core / Si-wall / Outer), O filler
-- 샘플링: 25,000--50,000 Latin Hypercube samples
+- Density model: **Broken power-law** (v < v_break: inner exponent, v >= v_break: outer exponent)
+- Composition model: **3-zone** (Core / Si-wall / Outer), O as filler element
+- Sampling: 25,000--50,000 Latin Hypercube samples
 
-### Stage 2: 6-Zone Composition (~48D)
+### Stage 2: 6-Zone Composition (~63D)
 
-Stage 1에서 글로벌 파라미터를 ±10% 범위로 고정하고, 6개 존에서 8종 중원소 조성을 개별 탐색합니다.
+Fixes global parameters from Stage 1 within ±10% and explores 8 heavy-element abundances independently across 6 radial zones.
 
-**6 Zones** (셸 30개를 6개 존으로 분할):
+**6 Zones** (30 shells divided into 6 zones):
 | Zone | Shells | Region |
 |------|--------|--------|
 | 1 | 0--4 | Innermost core |
@@ -70,15 +70,15 @@ Stage 1에서 글로벌 파라미터를 ±10% 범위로 고정하고, 6개 존�
 | Ti | 22 | 0.0001 -- 0.02 | Blue suppression (4000--4500 A) |
 | Cr | 24 | 0.0001 -- 0.02 | Fe-group blend (4500--4800 A) |
 
-Dimension: 15 (global, relaxed) + 6 x 8 (composition) = **63D**
+Total dimension: 15 (global, relaxed) + 6 x 8 (composition) = **63D**
 
 ### Stage 3: 15-Zone Composition (~135D)
 
-Stage 2의 6존 결과를 15존으로 세분화. PCA 기반 차원 축소 또는 parametric abundance profile을 통해 tractable하게 유지합니다.
+Refines Stage 2 results from 6 zones to 15 zones. Dimensionality is kept tractable via PCA-based reduction or parametric abundance profiles.
 
 ## Elements (11 species)
 
-LUMINA 시뮬레이션에 포함되는 원소 목록 (atomic data에서 확인됨):
+All elements included in LUMINA simulations (confirmed in atomic database):
 
 | Z | Element | Lines | Levels | Macro-atom | Status |
 |---|---------|-------|--------|------------|--------|
@@ -98,25 +98,25 @@ Total: **271,741 lines** in atomic database (kurucz_cd23_chianti_H_He.h5)
 
 ## Ni56 Decay Chain
 
-Co 함량은 고정값이 아니라 Ni56 방사성 붕괴 체인에서 물리적으로 계산됩니다:
+Co abundance is not a fixed value but is physically computed from the Ni56 radioactive decay chain:
 
 ```
   Ni56 ──(t_half=8.8d)──> Co56 ──(t_half=111.4d)──> Fe56
 ```
 
-시간 t_exp에서:
+At time t_exp (Bateman equations):
 - `X_Ni(t) = X_Ni_initial * exp(-lambda_Ni * t)`
 - `X_Co(t) = X_Ni_initial * lambda_Ni/(lambda_Co - lambda_Ni) * (exp(-lambda_Ni*t) - exp(-lambda_Co*t))`
 - `X_Fe_decay(t) = X_Ni_initial - X_Ni(t) - X_Co(t)`
 
-B-max (t ~ 19 days) 예시 (X_Ni_initial = 0.10):
+Example at B-max (t ~ 19 days, X_Ni_initial = 0.10):
 | Species | Fraction | Mass |
 |---------|----------|------|
 | Ni56 (remaining) | 22.4% | 0.0224 |
 | Co56 (from decay) | 72.2% | 0.0722 |
 | Fe56 (from decay) | 5.5% | 0.0054 |
 
-Fe56 from decay는 zone Fe에 합산됩니다. 전체 질량은 보존됩니다.
+Fe56 from decay is added to the zone's Fe abundance. Total mass is conserved.
 
 ## Pipeline
 
@@ -124,9 +124,9 @@ Fe56 from decay는 zone Fe에 합산됩니다. 전체 질량은 보존됩니다.
 
 ```
 scripts/
-  01_generate_training_data.py   # LHS sampling → LUMINA simulation → (params, spectrum) pairs
-  02_preprocess.py               # Savitzky-Golay smoothing → asinh transform → PCA
-  03_train_emulator.py           # MLP emulator: params → PCA coefficients
+  01_generate_training_data.py   # LHS sampling -> LUMINA simulation -> (params, spectrum) pairs
+  02_preprocess.py               # Savitzky-Golay smoothing -> asinh transform -> PCA
+  03_train_emulator.py           # MLP emulator: params -> PCA coefficients
   04_run_inference.py            # Bayesian inference: MCMC / Nested / SBI
   05_plot_results.py             # Corner plots, spectrum comparison, diagnostics
 ```
@@ -144,11 +144,11 @@ python3 scripts/01_generate_training_data.py --resume
 python3 scripts/01_generate_training_data.py --mode cpu --omp-threads 64
 ```
 
-`--mode both`에서 GPU와 CPU는 **동적 작업 큐**로 작동합니다:
-- 모든 모델이 공유 큐에 들어감
-- GPU/CPU 스레드가 각자 큐에서 다음 모델을 가져감
-- 빠른 디바이스가 자연스럽게 더 많은 모델을 처리
-- 100개 모델마다 자동 체크포인트
+In `--mode both`, GPU and CPU workers share a **dynamic work queue**:
+- All models are placed into a shared queue
+- GPU and CPU threads each pull the next available model from the queue
+- Faster devices naturally process more models
+- Automatic checkpoint every 100 models
 
 ### Step 2: Preprocess
 
@@ -158,7 +158,7 @@ python3 scripts/02_preprocess.py
 
 - Adaptive Savitzky-Golay smoothing (UV: 155A, Optical: 55A, NIR: 105A)
 - asinh transform (softening=0.05, equalizes UV/optical dynamic range)
-- PCA 차원 축소 (99.9% variance retained)
+- PCA dimensionality reduction (99.9% variance retained)
 
 ### Step 3: Train Emulator
 
@@ -176,7 +176,7 @@ python3 scripts/03_train_emulator.py
 python3 scripts/04_run_inference.py
 ```
 
-3가지 방법으로 posterior 추정:
+Three methods for posterior estimation:
 - **MCMC** (emcee): 64 walkers, 2000 burn-in, 5000 production
 - **Nested sampling** (dynesty): 500 live points
 - **SBI** (sbi/SNPE): Neural posterior estimation
@@ -189,29 +189,29 @@ python3 scripts/05_plot_results.py
 
 ## Relaxed Parameter Inheritance
 
-각 stage에서 이전 결과의 ±10%를 탐색 범위로 사용합니다:
+Each stage uses ±10% of the previous stage's best-fit as its search range:
 
 ```python
 from lumina_ml.config import relaxed_ranges
 
 stage1_best = {'log_L': 43.10, 'v_inner': 11500, ...}
 stage2_ranges = relaxed_ranges(stage1_best, param_names, param_ranges, margin=0.10)
-# log_L: 43.10 → [43.00, 43.20]  (range-based, prior width의 10%)
-# v_inner: 11500 → [10350, 12650]  (value-based, 값의 10%)
-# 새 파라미터: 전체 범위 유지
+# log_L: 43.10 -> [43.00, 43.20]  (range-based, 10% of prior width)
+# v_inner: 11500 -> [10350, 12650]  (value-based, 10% of the value)
+# New parameters: full prior range retained
 ```
 
-로그/지수 파라미터는 **prior width의 10%**, 일반 파라미터는 **값의 10%**를 사용합니다.
+Log/exponent parameters use **10% of the prior width**, while linear parameters use **10% of the value itself**.
 
 ## Project Structure
 
 ```
 Lumina-ML/
   lumina_ml/
-    config.py          # 모든 설정: 파라미터 범위, 원소, 네트워크, 추론
+    config.py          # All settings: parameter ranges, elements, network, inference
     data_utils.py      # ModelParams, LuminaRunner, LHS sampling
     preprocessing.py   # SG smoothing, asinh, PCA
-    emulator.py        # MLP 에뮬레이터 (PyTorch)
+    emulator.py        # MLP emulator (PyTorch)
     inference.py       # MCMC, Nested, SBI wrapper
   scripts/             # 5-step pipeline scripts
   data/
