@@ -382,10 +382,15 @@ class LuminaRunner:
                 f.write(f"{i},{W},{T_rad}\n")
 
     def run_model(self, params: ModelParams, n_packets: int, n_iters: int,
-                  tag: str = "", timeout: int = 600) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+                  tag: str = "", timeout: int = 600,
+                  env: dict = None) -> Optional[Tuple[np.ndarray, np.ndarray]]:
         """Run LUMINA and return (wavelength, flux) arrays, or None on failure.
 
         Returns the rotation spectrum (Doppler-weighted observer-frame).
+
+        Args:
+            env: Optional environment dict for subprocess (e.g., CUDA_VISIBLE_DEVICES).
+                 If None, inherits parent environment.
         """
         temp_dir = self.create_model_dir(params, tag=tag)
         work_dir = cfg.TMPDIR_BASE / f"work_{tag}_{id(params):x}"
@@ -395,6 +400,7 @@ class LuminaRunner:
             proc = subprocess.run(
                 [str(self.binary), str(temp_dir), str(n_packets), str(n_iters), "rotation"],
                 capture_output=True, timeout=timeout, cwd=str(work_dir), text=True,
+                env=env,
             )
             if proc.returncode != 0:
                 return None
