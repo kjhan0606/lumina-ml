@@ -133,21 +133,35 @@ scripts/
 
 ### Step 1: Generate Training Data
 
+Supports **multi-GPU** and **multi-CPU worker** parallel execution. All workers pull from a single shared queue for automatic load balancing.
+
 ```bash
-# Auto-detect GPU+CPU, dynamic work queue
-python3 scripts/01_generate_training_data.py --n-models 25000 --mode both
+# Auto-detect all GPUs + 1 CPU worker (default)
+python3 scripts/01_generate_training_data.py --n-models 50000 --mode both
+
+# Multi-GPU (2 GPUs) + multi-CPU (3 workers, 64 OMP threads split evenly)
+python3 scripts/01_generate_training_data.py --mode both --n-gpus 2 --n-cpu-workers 3 --omp-threads 64
+
+# CPU only with 4 workers (16 OMP threads each)
+python3 scripts/01_generate_training_data.py --mode cpu --n-cpu-workers 4 --omp-threads 64
 
 # Resume from checkpoint
 python3 scripts/01_generate_training_data.py --resume
-
-# CPU only
-python3 scripts/01_generate_training_data.py --mode cpu --omp-threads 64
 ```
 
-In `--mode both`, GPU and CPU workers share a **dynamic work queue**:
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--n-gpus` | auto-detect | Number of GPU workers (each gets `CUDA_VISIBLE_DEVICES`) |
+| `--n-cpu-workers` | 1 | Number of CPU worker threads |
+| `--omp-threads` | 64 | Total OMP threads, divided evenly among CPU workers |
+| `--mode` | auto | `cuda`, `cpu`, `both`, or `auto` |
+| `--resume` | - | Continue from last checkpoint |
+
+In all modes, workers share a **dynamic work queue**:
 - All models are placed into a shared queue
-- GPU and CPU threads each pull the next available model from the queue
+- Each worker (GPU or CPU) pulls the next available model when idle
 - Faster devices naturally process more models
+- Per-device statistics reported (e.g., `GPU0:1234 GPU1:1198 CPU:567`)
 - Automatic checkpoint every 100 models
 
 ### Step 2: Preprocess
