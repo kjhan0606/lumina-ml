@@ -32,9 +32,12 @@ V_OUTER = 25000.0           # Outer velocity boundary (km/s)
 N_SHELLS = 30               # Number of radial shells
 T_REF = 19.0                # Reference epoch (days) — SN 2011fe B-max
 
-# Ni56 decay constants (for luminosity evolution)
+# Ni56 → Co56 → Fe56 decay chain
 TAU_NI = 8.8    # Ni56 half-life (days)
 TAU_CO = 111.4  # Co56 half-life (days)
+LN2 = 0.6931471805599453
+LAMBDA_NI = LN2 / TAU_NI   # 0.07876 /day (Ni56 decay rate)
+LAMBDA_CO = LN2 / TAU_CO   # 0.006223 /day (Co56 decay rate)
 
 # ===== 15D Parameter Space =====
 PARAM_NAMES = [
@@ -45,21 +48,21 @@ PARAM_NAMES = [
 ]
 
 PARAM_RANGES = [
-    (42.80, 43.15),    # log_L (erg/s)
-    (8000, 13000),     # v_inner (km/s)
-    (-13.5, -12.7),    # log_rho_0 (g/cm^3)
+    (42.50, 43.50),    # log_L (erg/s) — expanded both sides
+    (7000, 15000),     # v_inner (km/s) — expanded both sides
+    (-14.0, -12.3),    # log_rho_0 (g/cm^3) — expanded both sides
     (-10, -4),         # density_exp (inner slope)
     (0.7, 1.0),        # T_e_ratio
-    (10000, 16000),    # v_core (km/s)
-    (14000, 22000),    # v_wall (km/s)
-    (0.2, 0.8),        # X_Fe_core
-    (0.2, 0.7),        # X_Si_wall
-    (12000, 20000),    # v_break (km/s)
-    (-14, -6),         # density_exp_outer
-    (12.0, 25.0),      # t_exp (days)
-    (0.01, 0.40),      # X_Fe_wall (Fe in wall zone)
-    (0.02, 0.20),      # X_Ni (Ni abundance, all zones)
-    (0.005, 0.10),     # X_Fe_outer (Fe in outer zone)
+    (9000, 17000),     # v_core (km/s) — expanded both sides
+    (12000, 24000),    # v_wall (km/s) — lower bound expanded
+    (0.05, 0.85),      # X_Fe_core — lower bound expanded
+    (0.05, 0.75),      # X_Si_wall — lower bound expanded
+    (10000, 22000),    # v_break (km/s) — expanded both sides
+    (-14, -4),         # density_exp_outer — upper bound expanded
+    (10.0, 28.0),      # t_exp (days) — expanded both sides
+    (0.001, 0.50),     # X_Fe_wall (Fe in wall zone) — expanded both sides
+    (0.005, 0.25),     # X_Ni (Ni abundance, all zones) — expanded both sides
+    (0.001, 0.15),     # X_Fe_outer (Fe in outer zone) — expanded both sides
 ]
 
 PARAM_RANGES_DICT = dict(zip(PARAM_NAMES, PARAM_RANGES))
@@ -67,19 +70,22 @@ PARAM_RANGES_DICT = dict(zip(PARAM_NAMES, PARAM_RANGES))
 N_PARAMS = len(PARAM_NAMES)  # 15
 
 # ===== Fixed abundances (not free parameters) =====
-# Note: Ni (28) is now a free parameter (X_Ni), Co and C remain fixed
+# Co is now computed from Ni56 decay chain (not fixed)
 FIXED_SPECIES = {
-    27: 0.05,   # Co (fixed)
-    6:  0.02,   # C (fixed)
+    6:  0.02,   # C (fixed — mostly burned, weak optical lines)
 }
-FIXED_SPECIES_SUM_BASE = sum(FIXED_SPECIES.values())  # 0.07 (without Ni)
+FIXED_SPECIES_SUM_BASE = sum(FIXED_SPECIES.values())  # 0.02
 
-# Fixed S and Ca per zone
+# Fixed abundances per zone (Stage 1 — freed in Stage 2)
 ZONE_S  = {'core': 0.05, 'wall': 0.05, 'outer': 0.02}
 ZONE_CA = {'core': 0.03, 'wall': 0.03, 'outer': 0.01}
+ZONE_MG = {'core': 0.005, 'wall': 0.01, 'outer': 0.02}   # IME, outer layers
+ZONE_TI = {'core': 0.001, 'wall': 0.002, 'outer': 0.0005} # trace, Si-burning
+ZONE_CR = {'core': 0.002, 'wall': 0.003, 'outer': 0.001}  # trace, Fe-group
 
-# Element ordering in abundances.csv
-ELEMENT_ORDER = [6, 8, 14, 16, 20, 26, 27, 28]
+# Element ordering in abundances.csv (must match atom_masses.csv)
+# C=6, O=8, Mg=12, Si=14, S=16, Ca=20, Ti=22, Cr=24, Fe=26, Co=27, Ni=28
+ELEMENT_ORDER = [6, 8, 12, 14, 16, 20, 22, 24, 26, 27, 28]
 
 # Files regenerated per model (rest are symlinked from reference)
 REGEN_FILES = {
@@ -166,3 +172,68 @@ BATCH_SAVE_INTERVAL = 100
 
 # ===== Feature windows for Si II measurement =====
 SI_II_REST = 6355.0  # Si II 6355 rest wavelength (Angstrom)
+
+# ===== Multi-stage refinement =====
+RELAXATION_MARGIN = 0.10   # ±10% around previous-stage best-fit
+
+# Stage 2: 6-zone heavy-element composition
+STAGE2_N_ZONES = 6
+STAGE2_SPECIES = [26, 14, 16, 20, 28, 12, 22, 24]  # Fe, Si, S, Ca, Ni, Mg, Ti, Cr
+STAGE2_SPECIES_NAMES = ['Fe', 'Si', 'S', 'Ca', 'Ni', 'Mg', 'Ti', 'Cr']
+STAGE2_ABUNDANCE_RANGES = {
+    26: (0.001, 0.85),  # Fe
+    14: (0.001, 0.75),  # Si
+    16: (0.001, 0.10),  # S
+    20: (0.001, 0.10),  # Ca
+    28: (0.001, 0.40),  # Ni (initial Ni56)
+    12: (0.001, 0.10),  # Mg
+    22: (0.0001, 0.02), # Ti (trace, but strong blue lines)
+    24: (0.0001, 0.02), # Cr (trace, Fe-group blend)
+}
+
+# Stage 3: 15-zone (finer granularity)
+STAGE3_N_ZONES = 15
+
+
+# Parameters where ±margin applies to the full prior width (not the value itself)
+# — log-scale params have large absolute values but small meaningful ranges
+_RANGE_BASED_MARGIN = {'log_L', 'log_rho_0', 'density_exp', 'density_exp_outer'}
+
+
+def relaxed_ranges(best_fit, param_names, param_ranges, margin=RELAXATION_MARGIN):
+    """Create parameter ranges relaxed ±margin around previous-stage best-fit.
+
+    Args:
+        best_fit: dict {param_name: best_value} from previous stage
+        param_names: list of parameter names for this stage
+        param_ranges: list of (lo, hi) full prior ranges for this stage
+        margin: fractional relaxation (default 0.10 = ±10%)
+
+    Returns:
+        list of (lo, hi) tuples — narrowed for inherited params, full for new params
+    """
+    relaxed = []
+    for name, (full_lo, full_hi) in zip(param_names, param_ranges):
+        if name in best_fit:
+            val = best_fit[name]
+            if name in _RANGE_BASED_MARGIN:
+                # Log/exponent params: ±margin of the full prior width
+                delta = margin * (full_hi - full_lo)
+            elif abs(val) < 1e-10:
+                # Near-zero: fallback to range-based
+                delta = margin * (full_hi - full_lo)
+            else:
+                # Normal: ±margin of the value itself
+                delta = abs(val) * margin
+            lo = max(full_lo, val - delta)
+            hi = min(full_hi, val + delta)
+            # Ensure at least a tiny range
+            if hi <= lo:
+                mid = (lo + hi) / 2
+                lo = mid - 1e-6
+                hi = mid + 1e-6
+            relaxed.append((lo, hi))
+        else:
+            # New parameter: use full prior range
+            relaxed.append((full_lo, full_hi))
+    return relaxed

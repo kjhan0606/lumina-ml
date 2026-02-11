@@ -4,6 +4,9 @@
 Runs LUMINA models across a 15D Latin Hypercube to produce (params, spectrum) pairs.
 Supports parallel execution via CUDA (serial GPU), CPU (OpenMP), or both simultaneously.
 
+In 'both' mode, a shared work queue dynamically distributes models between GPU and CPU
+workers — whichever device finishes first picks up the next model automatically.
+
 Usage:
   python3 scripts/01_generate_training_data.py                          # auto-detect
   python3 scripts/01_generate_training_data.py --mode both              # GPU + CPU simultaneously
@@ -13,10 +16,10 @@ Usage:
 
 import argparse
 import os
+import queue
 import sys
 import time
 import threading
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -27,34 +30,41 @@ from lumina_ml import config as cfg
 from lumina_ml.data_utils import LuminaRunner, ModelParams, latin_hypercube
 
 
-def run_single_cpu(args_tuple):
-    """Worker function for CPU execution in subprocess."""
-    binary, ref_dir, params_arr, n_packets, n_iters, idx, omp_threads = args_tuple
-    os.environ['OMP_NUM_THREADS'] = str(omp_threads)
-    try:
-        runner = LuminaRunner(binary=binary, ref_dir=ref_dir)
-        params = ModelParams.from_array(params_arr)
-        result = runner.run_model(params, n_packets, n_iters, tag=f"cpu_{idx}")
-        if result is not None:
-            wave, flux = result
-            return (idx, wave, flux)
-    except Exception as e:
-        print(f"  [CPU Model {idx}] Error: {e}", flush=True)
-    return (idx, None, None)
-
-
 class SharedState:
-    """Thread-safe shared state for CUDA+CPU dual execution."""
-    def __init__(self, n_total):
+    """Thread-safe shared state with dynamic work queue for CUDA+CPU dual execution.
+
+    Instead of pre-splitting models between GPU and CPU, all remaining model indices
+    are placed in a shared queue. Each worker (GPU or CPU) pulls the next model from
+    the queue when it finishes, ensuring perfect load balancing regardless of per-model
+    runtime variation.
+    """
+    def __init__(self, n_total, remaining_indices):
         self.lock = threading.Lock()
         self.spectra_dict = {}
         self.completed_indices = set()
         self.n_success = 0
         self.n_fail = 0
         self.n_total = n_total
+        self.n_cuda = 0
+        self.n_cpu = 0
+        # Shared work queue: all remaining models
+        self.work_queue = queue.Queue()
+        for idx in remaining_indices:
+            self.work_queue.put(idx)
+
+    def get_next(self):
+        """Get next model index from queue, or None if empty."""
+        try:
+            return self.work_queue.get_nowait()
+        except queue.Empty:
+            return None
 
     def add_result(self, idx, wave, flux, source):
         with self.lock:
+            if source.strip() == "CUDA":
+                self.n_cuda += 1
+            else:
+                self.n_cpu += 1
             if wave is not None:
                 self.spectra_dict[idx] = (wave, flux)
                 self.completed_indices.add(idx)
@@ -77,8 +87,6 @@ def main():
                         help='Execution mode (default: auto)')
     parser.add_argument('--omp-threads', type=int, default=64,
                         help='OMP threads for CPU (default: 64)')
-    parser.add_argument('--cuda-fraction', type=float, default=None,
-                        help='Fraction of models for CUDA (auto-computed if not set)')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed for LHS (default: 42)')
     parser.add_argument('--resume', action='store_true',
@@ -148,43 +156,35 @@ def main():
 
     t0 = time.time()
 
-    # ===== BOTH mode: CUDA + CPU simultaneously =====
+    # ===== BOTH mode: CUDA + CPU with dynamic work queue =====
     if args.mode == 'both':
-        # Split work: compute fraction based on speed ratio
-        if args.cuda_fraction is not None:
-            cuda_frac = args.cuda_fraction
-        else:
-            # From benchmark: CUDA ~4s, CPU64 ~1.8s -> CPU is 2.2x faster
-            # CUDA gets 1/(1+2.2) = 31% of work
-            cuda_frac = 0.31
-        n_cuda = int(len(remaining) * cuda_frac)
-        n_cpu = len(remaining) - n_cuda
-
-        cuda_indices = remaining[:n_cuda]
-        cpu_indices = remaining[n_cuda:]
-
-        print(f"\n  BOTH mode: CUDA={n_cuda} models ({cuda_frac:.0%}), CPU={n_cpu} models ({1-cuda_frac:.0%})")
+        print(f"\n  BOTH mode: dynamic work queue ({len(remaining)} models)")
+        print(f"  GPU and CPU pull from shared queue — no static split")
         print(f"  CPU: OMP_NUM_THREADS={args.omp_threads}")
 
-        state = SharedState(len(all_params))
+        state = SharedState(len(all_params), remaining)
         state.spectra_dict = spectra_dict
         state.completed_indices = completed_indices
         state.n_success = len(completed_indices)
 
         batch_count = [0]  # mutable for closure
 
-        def run_cuda_worker():
-            runner = LuminaRunner(binary=cfg.LUMINA_CUDA)
-            for idx in cuda_indices:
+        def device_worker(device_name, runner):
+            """Generic worker: pull from shared queue until empty."""
+            while True:
+                idx = state.get_next()
+                if idx is None:
+                    break
                 params = all_params[idx]
                 t1 = time.time()
-                result = runner.run_model(params, args.n_packets, args.n_iters, tag=f"cuda_{idx}")
+                tag = f"{device_name.lower().strip()}_{idx}"
+                result = runner.run_model(params, args.n_packets, args.n_iters, tag=tag)
                 dt = time.time() - t1
                 if result is not None:
                     wave, flux = result
-                    msg = state.add_result(idx, wave, flux, "CUDA")
+                    msg = state.add_result(idx, wave, flux, device_name)
                 else:
-                    msg = state.add_result(idx, None, None, "CUDA")
+                    msg = state.add_result(idx, None, None, device_name)
                 print(f"{msg} ({dt:.1f}s)", flush=True)
                 batch_count[0] += 1
                 if batch_count[0] % cfg.BATCH_SAVE_INTERVAL == 0:
@@ -194,36 +194,24 @@ def main():
                     elapsed = time.time() - t0
                     rate = batch_count[0] / elapsed
                     eta = (len(remaining) - batch_count[0]) / rate if rate > 0 else 0
-                    print(f"  -- Checkpoint. Rate: {rate:.2f}/s, ETA: {eta/3600:.1f}h --", flush=True)
+                    print(f"  -- Checkpoint. Rate: {rate:.2f}/s, ETA: {eta/3600:.1f}h"
+                          f" [GPU:{state.n_cuda} CPU:{state.n_cpu}] --", flush=True)
 
-        def run_cpu_worker():
-            os.environ['OMP_NUM_THREADS'] = str(args.omp_threads)
-            runner = LuminaRunner(binary=cfg.LUMINA_CPU)
-            for idx in cpu_indices:
-                params = all_params[idx]
-                t1 = time.time()
-                result = runner.run_model(params, args.n_packets, args.n_iters, tag=f"cpu_{idx}")
-                dt = time.time() - t1
-                if result is not None:
-                    wave, flux = result
-                    msg = state.add_result(idx, wave, flux, "CPU ")
-                else:
-                    msg = state.add_result(idx, None, None, "CPU ")
-                print(f"{msg} ({dt:.1f}s)", flush=True)
-                batch_count[0] += 1
-                if batch_count[0] % cfg.BATCH_SAVE_INTERVAL == 0:
-                    with state.lock:
-                        _save_checkpoint(params_array, state.spectra_dict, state.completed_indices,
-                                         params_file, spectra_file, waves_file, checkpoint_file)
+        cuda_runner = LuminaRunner(binary=cfg.LUMINA_CUDA)
+        os.environ['OMP_NUM_THREADS'] = str(args.omp_threads)
+        cpu_runner = LuminaRunner(binary=cfg.LUMINA_CPU)
 
-        cuda_thread = threading.Thread(target=run_cuda_worker)
-        cpu_thread = threading.Thread(target=run_cpu_worker)
+        cuda_thread = threading.Thread(target=device_worker, args=("CUDA", cuda_runner))
+        cpu_thread = threading.Thread(target=device_worker, args=("CPU ", cpu_runner))
 
         cuda_thread.start()
         cpu_thread.start()
 
         cuda_thread.join()
         cpu_thread.join()
+
+        print(f"  Final split: GPU={state.n_cuda}, CPU={state.n_cpu}"
+              f" ({state.n_cuda/(state.n_cuda+state.n_cpu)*100:.0f}%/{state.n_cpu/(state.n_cuda+state.n_cpu)*100:.0f}%)")
 
         spectra_dict = state.spectra_dict
         completed_indices = state.completed_indices

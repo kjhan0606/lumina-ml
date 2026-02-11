@@ -76,20 +76,56 @@ class ModelParams:
 
         return rho * t_scale
 
+    @property
+    def ni56_decay_fractions(self):
+        """Ni56 → Co56 → Fe56 decay fractions at time t_exp.
+
+        Returns (f_Ni, f_Co, f_Fe) where f_Ni + f_Co + f_Fe = 1.
+        X_Ni parameter represents initial Ni56 mass fraction at explosion.
+        """
+        t = self.t_exp  # days
+        f_Ni = np.exp(-cfg.LAMBDA_NI * t)
+        f_Co = (cfg.LAMBDA_NI / (cfg.LAMBDA_CO - cfg.LAMBDA_NI)
+                * (np.exp(-cfg.LAMBDA_NI * t) - np.exp(-cfg.LAMBDA_CO * t)))
+        f_Fe = 1.0 - f_Ni - f_Co
+        return f_Ni, f_Co, f_Fe
+
     def zone_abundances(self, zone):
-        """Return (X_Si, X_Fe, X_S, X_Ca, X_Ni, X_O) for a given zone."""
+        """Return dict {Z: mass_fraction} for a given zone.
+
+        Fe includes zone Fe + Fe56 from Ni56 decay.
+        Ni and Co are computed from Ni56 → Co56 → Fe56 decay chain at t_exp.
+        O is the filler (1 - sum of all others).
+        """
         if zone == 'core':
-            X_Si, X_Fe = 0.05, self.X_Fe_core
+            X_Si, X_Fe_zone = 0.05, self.X_Fe_core
         elif zone == 'wall':
-            X_Si, X_Fe = self.X_Si_wall, self.X_Fe_wall
+            X_Si, X_Fe_zone = self.X_Si_wall, self.X_Fe_wall
         else:  # outer
-            X_Si, X_Fe = 0.02, self.X_Fe_outer
-        X_S = cfg.ZONE_S[zone]
+            X_Si, X_Fe_zone = 0.02, self.X_Fe_outer
+
+        X_S  = cfg.ZONE_S[zone]
         X_Ca = cfg.ZONE_CA[zone]
-        X_Ni = self.X_Ni
-        # O = filler: 1.0 - (Co + C) - Si - Fe - S - Ca - Ni
-        X_O = 1.0 - cfg.FIXED_SPECIES_SUM_BASE - X_Si - X_Fe - X_S - X_Ca - X_Ni
-        return X_Si, X_Fe, X_S, X_Ca, X_Ni, X_O
+        X_Mg = cfg.ZONE_MG[zone]
+        X_Ti = cfg.ZONE_TI[zone]
+        X_Cr = cfg.ZONE_CR[zone]
+
+        # Ni56 decay chain: X_Ni is initial Ni56 at t=0
+        f_Ni, f_Co, f_Fe = self.ni56_decay_fractions
+        X_Ni = self.X_Ni * f_Ni      # remaining Ni56
+        X_Co = self.X_Ni * f_Co      # Co56 from decay
+        X_Fe = X_Fe_zone + self.X_Ni * f_Fe  # zone Fe + Fe56 from decay
+
+        # O = filler (total mass = 1)
+        X_O = (1.0 - cfg.FIXED_SPECIES_SUM_BASE
+               - X_Si - X_Fe - X_S - X_Ca - X_Ni - X_Co
+               - X_Mg - X_Ti - X_Cr)
+
+        return {
+            6: cfg.FIXED_SPECIES[6],  # C
+            8: X_O, 12: X_Mg, 14: X_Si, 16: X_S, 20: X_Ca,
+            22: X_Ti, 24: X_Cr, 26: X_Fe, 27: X_Co, 28: X_Ni,
+        }
 
     def is_valid(self):
         """Check physical validity constraints."""
@@ -109,8 +145,8 @@ class ModelParams:
             return False
         # Oxygen filler must be positive in all zones
         for zone in ('core', 'wall', 'outer'):
-            *_, X_O = self.zone_abundances(zone)
-            if X_O < 0.03:
+            abund = self.zone_abundances(zone)
+            if abund[8] < 0.03:  # O = filler
                 return False
         # Wall Fe + Si must not exceed budget
         if self.X_Fe_wall + self.X_Si_wall > 0.65:
@@ -306,22 +342,9 @@ class LuminaRunner:
             else:
                 zone = 'outer'
 
-            X_Si, X_Fe, X_S, X_Ca, X_Ni, X_O = params.zone_abundances(zone)
+            zone_abund = params.zone_abundances(zone)
             for z in cfg.ELEMENT_ORDER:
-                if z == 8:
-                    abundances[z][i] = X_O
-                elif z == 14:
-                    abundances[z][i] = X_Si
-                elif z == 26:
-                    abundances[z][i] = X_Fe
-                elif z == 16:
-                    abundances[z][i] = X_S
-                elif z == 20:
-                    abundances[z][i] = X_Ca
-                elif z == 28:
-                    abundances[z][i] = X_Ni
-                else:
-                    abundances[z][i] = cfg.FIXED_SPECIES[z]
+                abundances[z][i] = zone_abund[z]
 
         with open(dirpath / "abundances.csv", 'w') as f:
             header = "atomic_number," + ",".join(str(i) for i in range(cfg.N_SHELLS))
