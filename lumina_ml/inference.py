@@ -59,6 +59,72 @@ def log_prior(theta: np.ndarray) -> float:
     return 0.0
 
 
+def log_prior_stage2(theta: np.ndarray, param_ranges: list = None) -> float:
+    """Uniform prior for Stage 2 (63D) within param_ranges + physical validity.
+
+    Args:
+        theta: 63-element parameter vector (15 physical + 48 zone composition).
+        param_ranges: List of 63 (lo, hi) tuples. If None, uses STAGE2_PARAM_RANGES.
+    """
+    if param_ranges is None:
+        param_ranges = cfg.STAGE2_PARAM_RANGES
+
+    # Range check for all 63 params
+    for i, (lo, hi) in enumerate(param_ranges):
+        if theta[i] < lo or theta[i] > hi:
+            return -np.inf
+
+    # Physical velocity constraints (same as Stage 1)
+    v_inner = theta[1]
+    v_core = theta[5]
+    v_wall = theta[6]
+    v_break = theta[9]
+
+    if v_core + 1000 >= v_wall:
+        return -np.inf
+    if v_core <= v_inner:
+        return -np.inf
+    if v_wall >= cfg.V_OUTER:
+        return -np.inf
+    if v_break <= v_inner + 1000:
+        return -np.inf
+    if v_break >= cfg.V_OUTER - 1000:
+        return -np.inf
+
+    # Check O filler >= 0.03 for all 6 zones
+    # Zone params start at index 15, each zone has 8 species:
+    # [Fe, Si, S, Ca, Ni, Mg, Ti, Cr] per zone
+    t_exp = theta[11]
+    f_Ni = np.exp(-cfg.LAMBDA_NI * t_exp)
+    f_Co = (cfg.LAMBDA_NI / (cfg.LAMBDA_CO - cfg.LAMBDA_NI)
+            * (np.exp(-cfg.LAMBDA_NI * t_exp) - np.exp(-cfg.LAMBDA_CO * t_exp)))
+    f_Fe_decay = 1.0 - f_Ni - f_Co
+
+    for zi in range(cfg.STAGE2_N_ZONES):
+        base = 15 + zi * 8
+        X_Fe_zone = theta[base + 0]
+        X_Si = theta[base + 1]
+        X_S = theta[base + 2]
+        X_Ca = theta[base + 3]
+        X_Ni_init = theta[base + 4]
+        X_Mg = theta[base + 5]
+        X_Ti = theta[base + 6]
+        X_Cr = theta[base + 7]
+
+        # Ni56 decay: Fe gets additional contribution
+        X_Fe = X_Fe_zone + X_Ni_init * f_Fe_decay
+        X_Ni = X_Ni_init * f_Ni
+        X_Co = X_Ni_init * f_Co
+
+        X_O = (1.0 - cfg.FIXED_SPECIES_SUM_BASE
+               - X_Si - X_Fe - X_S - X_Ca - X_Ni - X_Co
+               - X_Mg - X_Ti - X_Cr)
+        if X_O < 0.03:
+            return -np.inf
+
+    return 0.0
+
+
 # ===== Wavelength-dependent sigma =====
 def compute_sigma_array(grid: np.ndarray = None,
                         sigma_obs_base: float = 0.03,
@@ -110,7 +176,8 @@ class FeatureAwareLikelihood:
     def __init__(self, emulator, obs_spectrum: np.ndarray,
                  sigma_array: np.ndarray = None,
                  mode: str = 'spectrum',
-                 obs_features: dict = None):
+                 obs_features: dict = None,
+                 prior_fn=None):
         """
         Args:
             emulator: Emulator instance
@@ -119,11 +186,13 @@ class FeatureAwareLikelihood:
             mode: 'spectrum' or 'pca'
             obs_features: dict with measured features of observed spectrum
                           (si_ii_vel, si_ii_depth, uv_opt_ratio, etc.)
+            prior_fn: Prior function theta -> log_prior. Default: log_prior (Stage 1).
         """
         self.emulator = emulator
         self.obs = obs_spectrum
         self.mode = mode
         self.grid = cfg.SPECTRUM_GRID
+        self.prior_fn = prior_fn if prior_fn is not None else log_prior
 
         if sigma_array is None:
             sigma_array = compute_sigma_array()
@@ -175,7 +244,7 @@ class FeatureAwareLikelihood:
 
     def log_probability(self, theta: np.ndarray) -> float:
         """Log posterior = log prior + log likelihood."""
-        lp = log_prior(theta)
+        lp = self.prior_fn(theta)
         if not np.isfinite(lp):
             return -np.inf
         return lp + self.log_likelihood(theta)
@@ -191,27 +260,30 @@ def run_mcmc(likelihood,
              n_walkers: int = cfg.MCMC_N_WALKERS,
              n_burn: int = cfg.MCMC_N_BURN,
              n_production: int = cfg.MCMC_N_PRODUCTION,
+             n_params: int = None,
+             param_ranges: list = None,
              verbose: bool = True) -> dict:
     """Run MCMC inference using emcee."""
     import emcee
 
-    ndim = cfg.N_PARAMS
+    if param_ranges is None:
+        param_ranges = cfg.PARAM_RANGES
+    ndim = n_params if n_params is not None else len(param_ranges)
 
     if initial_guess is None:
-        initial_guess = np.array([(lo + hi) / 2 for lo, hi in cfg.PARAM_RANGES])
+        initial_guess = np.array([(lo + hi) / 2 for lo, hi in param_ranges])
 
     # Find MAP with differential evolution
     if verbose:
         print("  Finding MAP estimate with differential evolution...")
     try:
         from scipy.optimize import differential_evolution
-        bounds = cfg.PARAM_RANGES
 
         def neg_logprob(theta):
             lp = likelihood.log_probability(theta)
             return -lp if np.isfinite(lp) else 1e30
 
-        result = differential_evolution(neg_logprob, bounds, maxiter=200, seed=42,
+        result = differential_evolution(neg_logprob, param_ranges, maxiter=200, seed=42,
                                         tol=1e-4, polish=False)
         if result.success or result.fun < 1e29:
             initial_guess = result.x
@@ -222,12 +294,13 @@ def run_mcmc(likelihood,
             print(f"  DE optimization failed: {e}, using default initial guess")
 
     # Initialize walkers
-    scales = np.array([hi - lo for lo, hi in cfg.PARAM_RANGES]) * 0.01
+    scales = np.array([hi - lo for lo, hi in param_ranges]) * 0.01
     pos = np.array([initial_guess + scales * np.random.randn(ndim) for _ in range(n_walkers)])
 
+    prior_fn = likelihood.prior_fn
     for i in range(n_walkers):
         attempts = 0
-        while log_prior(pos[i]) == -np.inf and attempts < 1000:
+        while prior_fn(pos[i]) == -np.inf and attempts < 1000:
             pos[i] = initial_guess + scales * np.random.randn(ndim)
             attempts += 1
 
@@ -284,20 +357,25 @@ def run_mcmc(likelihood,
 def run_nested(likelihood,
                n_live: int = cfg.DYNESTY_LIVE_POINTS,
                dlogz: float = cfg.DYNESTY_DLOGZ,
+               n_params: int = None,
+               param_ranges: list = None,
                verbose: bool = True) -> dict:
     """Run nested sampling with dynesty."""
     import dynesty
 
-    ndim = cfg.N_PARAMS
+    if param_ranges is None:
+        param_ranges = cfg.PARAM_RANGES
+    ndim = n_params if n_params is not None else len(param_ranges)
+    prior_fn = likelihood.prior_fn
 
     def prior_transform(u):
         theta = np.empty(ndim)
-        for i, (lo, hi) in enumerate(cfg.PARAM_RANGES):
+        for i, (lo, hi) in enumerate(param_ranges):
             theta[i] = lo + u[i] * (hi - lo)
         return theta
 
     def loglike(theta):
-        lp = log_prior(theta)
+        lp = prior_fn(theta)
         if not np.isfinite(lp):
             return -1e30
         return likelihood.log_likelihood(theta)
@@ -334,19 +412,22 @@ def run_nested(likelihood,
 def run_sbi(training_params: np.ndarray, training_spectra: np.ndarray,
             obs_spectrum: np.ndarray,
             n_posterior_samples: int = 10000,
+            param_ranges: list = None,
             verbose: bool = True) -> dict:
     """Run Simulation-Based Inference using Neural Posterior Estimation (NPE)."""
     import torch
     from sbi.inference import SNPE
     from sbi.utils import BoxUniform
 
-    ndim = cfg.N_PARAMS
+    if param_ranges is None:
+        param_ranges = cfg.PARAM_RANGES
+    ndim = len(param_ranges)
 
     if verbose:
         print("  Setting up SBI (Neural Posterior Estimation)...")
 
-    low = torch.tensor([lo for lo, hi in cfg.PARAM_RANGES], dtype=torch.float32)
-    high = torch.tensor([hi for lo, hi in cfg.PARAM_RANGES], dtype=torch.float32)
+    low = torch.tensor([lo for lo, hi in param_ranges], dtype=torch.float32)
+    high = torch.tensor([hi for lo, hi in param_ranges], dtype=torch.float32)
     prior = BoxUniform(low=low, high=high)
 
     theta_tensor = torch.tensor(training_params, dtype=torch.float32)
@@ -389,10 +470,14 @@ def run_sbi(training_params: np.ndarray, training_spectra: np.ndarray,
     }
 
 
-def summary_statistics(samples: np.ndarray) -> dict:
+def summary_statistics(samples: np.ndarray, param_names: list = None) -> dict:
     """Compute summary statistics from posterior samples."""
+    if param_names is None:
+        param_names = cfg.PARAM_NAMES
     result = {}
-    for i, name in enumerate(cfg.PARAM_NAMES):
+    for i, name in enumerate(param_names):
+        if i >= samples.shape[1]:
+            break
         s = samples[:, i]
         result[name] = {
             'median': np.median(s),

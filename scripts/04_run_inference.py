@@ -25,7 +25,7 @@ from lumina_ml.preprocessing import (
 )
 from lumina_ml.emulator import Emulator
 from lumina_ml.inference import (
-    FeatureAwareLikelihood, compute_sigma_array,
+    FeatureAwareLikelihood, compute_sigma_array, log_prior_stage2,
     run_mcmc, run_nested, run_sbi, summary_statistics,
 )
 
@@ -53,22 +53,28 @@ def load_observed_spectrum():
     return asinh_transform(normalized)
 
 
-def print_summary(method_name, results):
+def print_summary(method_name, results, param_names=None):
     """Print posterior summary statistics."""
-    stats = summary_statistics(results['samples'])
+    if param_names is None:
+        param_names = cfg.PARAM_NAMES
+    stats = summary_statistics(results['samples'], param_names=param_names)
     print(f"\n{'='*60}")
     print(f"{method_name} -- Posterior Summary")
     print(f"{'='*60}")
     print(f"  {'Parameter':22s} {'Median':>10s} {'Std':>8s} {'16%':>10s} {'84%':>10s}")
     print(f"  {'-'*58}")
-    for name in cfg.PARAM_NAMES:
+    for name in param_names:
+        if name not in stats:
+            continue
         s = stats[name]
-        print(f"  {name:22s} {s['median']:10.3f} {s['std']:8.3f} "
-              f"{s['CI_16']:10.3f} {s['CI_84']:10.3f}")
+        print(f"  {name:22s} {s['median']:10.4f} {s['std']:8.4f} "
+              f"{s['CI_16']:10.4f} {s['CI_84']:10.4f}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Run Bayesian inference on SN 2011fe")
+    parser.add_argument('--stage', type=int, default=1, choices=[1, 2, 3],
+                        help='Pipeline stage (default: 1)')
     parser.add_argument('--method', choices=['mcmc', 'dynesty', 'sbi', 'all'],
                         default='all', help='Inference method (default: all)')
     parser.add_argument('--mcmc-walkers', type=int, default=cfg.MCMC_N_WALKERS)
@@ -78,7 +84,21 @@ def main():
     parser.add_argument('--dynesty-live', type=int, default=cfg.DYNESTY_LIVE_POINTS)
     args = parser.parse_args()
 
-    cfg.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    # Stage-specific config
+    _, data_processed, models_dir, results_dir = cfg.get_stage_paths(args.stage)
+    if args.stage == 2:
+        param_names = cfg.STAGE2_PARAM_NAMES
+        param_ranges = cfg.STAGE2_PARAM_RANGES
+        n_params = cfg.STAGE2_N_PARAMS
+        prior_fn = log_prior_stage2
+    else:
+        param_names = cfg.PARAM_NAMES
+        param_ranges = cfg.PARAM_RANGES
+        n_params = cfg.N_PARAMS
+        prior_fn = None  # default (Stage 1)
+
+    print(f"Stage: {args.stage} ({n_params}D)")
+    results_dir.mkdir(parents=True, exist_ok=True)
 
     # Load observed spectrum (asinh-transformed)
     print("Loading observed spectrum...")
@@ -102,7 +122,7 @@ def main():
     emulator = None
     if 'mcmc' in methods or 'dynesty' in methods:
         print("\nLoading trained emulator...")
-        emulator = Emulator.load(cfg.MODELS_DIR, cfg.DATA_PROCESSED)
+        emulator = Emulator.load(models_dir, data_processed)
         print(f"  Device: {emulator.device}")
 
     # ===== MCMC =====
@@ -116,6 +136,7 @@ def main():
             sigma_array=sigma_array,
             mode='spectrum',
             obs_features=obs_features,
+            prior_fn=prior_fn,
         )
 
         t0 = time.time()
@@ -124,13 +145,15 @@ def main():
             n_walkers=args.mcmc_walkers,
             n_burn=args.mcmc_burn,
             n_production=args.mcmc_production,
+            n_params=n_params,
+            param_ranges=param_ranges,
         )
         print(f"  Total MCMC time: {time.time()-t0:.1f}s")
 
-        np.save(str(cfg.RESULTS_DIR / "mcmc_samples.npy"), mcmc_results['samples'])
-        np.save(str(cfg.RESULTS_DIR / "mcmc_log_prob.npy"), mcmc_results['log_prob'])
-        print(f"  Saved to {cfg.RESULTS_DIR}/mcmc_*.npy")
-        print_summary("MCMC", mcmc_results)
+        np.save(str(results_dir / "mcmc_samples.npy"), mcmc_results['samples'])
+        np.save(str(results_dir / "mcmc_log_prob.npy"), mcmc_results['log_prob'])
+        print(f"  Saved to {results_dir}/mcmc_*.npy")
+        print_summary("MCMC", mcmc_results, param_names=param_names)
 
     # ===== SBI =====
     if 'sbi' in methods:
@@ -138,21 +161,22 @@ def main():
         print("SBI Inference (Neural Posterior Estimation)")
         print(f"{'='*60}")
 
-        params_train = np.load(str(cfg.DATA_PROCESSED / "params_train.npy"))
-        spectra_train = np.load(str(cfg.DATA_PROCESSED / "spectra_train.npy"))
+        params_train = np.load(str(data_processed / "params_train.npy"))
+        spectra_train = np.load(str(data_processed / "spectra_train.npy"))
         print(f"  Training pairs: {len(params_train)}")
 
         t0 = time.time()
         sbi_results = run_sbi(
             params_train, spectra_train, obs_spectrum,
             n_posterior_samples=args.sbi_samples,
+            param_ranges=param_ranges,
         )
         print(f"  Total SBI time: {time.time()-t0:.1f}s")
 
-        np.save(str(cfg.RESULTS_DIR / "sbi_samples.npy"), sbi_results['samples'])
-        np.save(str(cfg.RESULTS_DIR / "sbi_log_prob.npy"), sbi_results['log_prob'])
-        print(f"  Saved to {cfg.RESULTS_DIR}/sbi_*.npy")
-        print_summary("SBI", sbi_results)
+        np.save(str(results_dir / "sbi_samples.npy"), sbi_results['samples'])
+        np.save(str(results_dir / "sbi_log_prob.npy"), sbi_results['log_prob'])
+        print(f"  Saved to {results_dir}/sbi_*.npy")
+        print_summary("SBI", sbi_results, param_names=param_names)
 
     # ===== Nested Sampling =====
     if 'dynesty' in methods:
@@ -165,16 +189,18 @@ def main():
             sigma_array=sigma_array,
             mode='spectrum',
             obs_features=obs_features,
+            prior_fn=prior_fn,
         )
 
         t0 = time.time()
-        nested_results = run_nested(likelihood, n_live=args.dynesty_live)
+        nested_results = run_nested(likelihood, n_live=args.dynesty_live,
+                                     n_params=n_params, param_ranges=param_ranges)
         print(f"  Total dynesty time: {time.time()-t0:.1f}s")
 
-        np.save(str(cfg.RESULTS_DIR / "dynesty_samples.npy"), nested_results['samples'])
+        np.save(str(results_dir / "dynesty_samples.npy"), nested_results['samples'])
         print(f"  log(Z) = {nested_results['logz']:.2f} +/- {nested_results['logzerr']:.2f}")
-        print(f"  Saved to {cfg.RESULTS_DIR}/dynesty_*.npy")
-        print_summary("Nested Sampling", nested_results)
+        print(f"  Saved to {results_dir}/dynesty_*.npy")
+        print_summary("Nested Sampling", nested_results, param_names=param_names)
 
     # Comparison
     if len(methods) > 1:
@@ -187,13 +213,15 @@ def main():
 
         all_stats = {}
         for m in methods:
-            samples = np.load(str(cfg.RESULTS_DIR / f"{m}_samples.npy"))
-            all_stats[m] = summary_statistics(samples)
+            samples = np.load(str(results_dir / f"{m}_samples.npy"))
+            all_stats[m] = summary_statistics(samples, param_names=param_names)
 
-        for name in cfg.PARAM_NAMES:
+        for name in param_names:
+            if name not in all_stats[methods[0]]:
+                continue
             row = f"  {name:22s}"
             for m in methods:
-                row += f" {all_stats[m][name]['median']:12.3f}"
+                row += f" {all_stats[m][name]['median']:12.4f}"
             print(row)
 
     print("\nDone! Run 05_plot_results.py to generate plots.")

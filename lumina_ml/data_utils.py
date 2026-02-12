@@ -1,4 +1,4 @@
-"""LUMINA wrapper: ModelParams, model directory creation, execution, LHS sampling."""
+"""LUMINA wrapper: ModelParams, Stage2Params, model directory creation, execution, LHS sampling."""
 
 import json
 import os
@@ -6,9 +6,9 @@ import shutil
 import subprocess
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -177,10 +177,197 @@ class ModelParams:
         )
 
 
-def latin_hypercube(n_samples, param_ranges=None, rng=None):
-    """Generate Latin Hypercube samples in 12D parameter space.
+@dataclass
+class Stage2Params:
+    """63D parameters: 15 physical + 48 zone composition (6 zones × 8 species).
 
-    Returns list of valid ModelParams.
+    Zone mapping: z0=shells 0-4, z1=5-9, ..., z5=25-29.
+    Species per zone: Fe(26), Si(14), S(16), Ca(20), Ni(28), Mg(12), Ti(22), Cr(24).
+    """
+    # 15 physical parameters (same as ModelParams)
+    log_L: float
+    v_inner: float
+    log_rho_0: float
+    density_exp: float
+    T_e_ratio: float
+    v_core: float
+    v_wall: float
+    X_Fe_core: float
+    X_Si_wall: float
+    v_break: float
+    density_exp_outer: float
+    t_exp: float
+    X_Fe_wall: float
+    X_Ni: float
+    X_Fe_outer: float
+
+    # 48 zone composition parameters: zone_X[zone_id] = {Z: mass_fraction}
+    zone_X: Dict[int, Dict[int, float]] = field(default_factory=dict)
+
+    @property
+    def L_erg_s(self):
+        return 10**self.log_L
+
+    @property
+    def rho_0(self):
+        return 10**self.log_rho_0
+
+    @property
+    def t_exp_s(self):
+        return self.t_exp * 86400.0
+
+    @property
+    def v_inner_cm_s(self):
+        return self.v_inner * 1e5
+
+    @property
+    def T_inner_estimate(self):
+        R_inner = self.v_inner_cm_s * self.t_exp_s
+        return (self.L_erg_s / (4 * np.pi * cfg.SIGMA_SB * R_inner**2))**0.25
+
+    def density_at_v(self, v_mid):
+        rho_0 = self.rho_0
+        v_min = self.v_inner
+        t_scale = (cfg.T_REF / self.t_exp) ** 3
+        if v_mid < self.v_break:
+            rho = rho_0 * (v_mid / v_min) ** self.density_exp
+        else:
+            rho_break = rho_0 * (self.v_break / v_min) ** self.density_exp
+            rho = rho_break * (v_mid / self.v_break) ** self.density_exp_outer
+        return rho * t_scale
+
+    @property
+    def ni56_decay_fractions(self):
+        t = self.t_exp
+        f_Ni = np.exp(-cfg.LAMBDA_NI * t)
+        f_Co = (cfg.LAMBDA_NI / (cfg.LAMBDA_CO - cfg.LAMBDA_NI)
+                * (np.exp(-cfg.LAMBDA_NI * t) - np.exp(-cfg.LAMBDA_CO * t)))
+        f_Fe = 1.0 - f_Ni - f_Co
+        return f_Ni, f_Co, f_Fe
+
+    def zone_abundances(self, zone_id):
+        """Return dict {Z: mass_fraction} for zone_id (0-5).
+
+        Uses zone_X overrides for the 8 species. Ni56 decay is computed per-zone
+        from the zone's Ni abundance. C is fixed, O is filler.
+        """
+        if zone_id not in self.zone_X:
+            raise ValueError(f"No zone data for zone_id={zone_id}")
+
+        zx = self.zone_X[zone_id]
+        X_Fe_zone = zx[26]
+        X_Si = zx[14]
+        X_S = zx[16]
+        X_Ca = zx[20]
+        X_Ni_init = zx[28]  # initial Ni56
+        X_Mg = zx[12]
+        X_Ti = zx[22]
+        X_Cr = zx[24]
+
+        # Ni56 decay chain
+        f_Ni, f_Co, f_Fe = self.ni56_decay_fractions
+        X_Ni = X_Ni_init * f_Ni
+        X_Co = X_Ni_init * f_Co
+        X_Fe = X_Fe_zone + X_Ni_init * f_Fe
+
+        # O = filler
+        X_O = (1.0 - cfg.FIXED_SPECIES_SUM_BASE
+               - X_Si - X_Fe - X_S - X_Ca - X_Ni - X_Co
+               - X_Mg - X_Ti - X_Cr)
+
+        return {
+            6: cfg.FIXED_SPECIES[6],  # C
+            8: X_O, 12: X_Mg, 14: X_Si, 16: X_S, 20: X_Ca,
+            22: X_Ti, 24: X_Cr, 26: X_Fe, 27: X_Co, 28: X_Ni,
+        }
+
+    def is_valid(self):
+        # Physical velocity constraints (same as Stage 1)
+        if self.v_core + 1000 >= self.v_wall:
+            return False
+        if self.v_core <= self.v_inner:
+            return False
+        if self.v_wall >= cfg.V_OUTER:
+            return False
+        if self.v_break <= self.v_inner + 1000:
+            return False
+        if self.v_break >= cfg.V_OUTER - 1000:
+            return False
+        # O filler must be positive in all 6 zones
+        for zi in range(cfg.STAGE2_N_ZONES):
+            if zi not in self.zone_X:
+                return False
+            abund = self.zone_abundances(zi)
+            if abund[8] < 0.03:
+                return False
+        return True
+
+    def to_array(self):
+        """Convert to 63-element numpy array: 15 physical + 48 zone composition."""
+        phys = np.array([
+            self.log_L, self.v_inner, self.log_rho_0, self.density_exp,
+            self.T_e_ratio, self.v_core, self.v_wall, self.X_Fe_core,
+            self.X_Si_wall, self.v_break, self.density_exp_outer, self.t_exp,
+            self.X_Fe_wall, self.X_Ni, self.X_Fe_outer,
+        ])
+        zone_vals = []
+        for zi in range(cfg.STAGE2_N_ZONES):
+            zx = self.zone_X.get(zi, {})
+            for sp_z in cfg.STAGE2_SPECIES:
+                zone_vals.append(zx.get(sp_z, 0.0))
+        return np.concatenate([phys, np.array(zone_vals)])
+
+    @classmethod
+    def from_array(cls, arr):
+        """Create from 63-element numpy array."""
+        arr = np.asarray(arr, dtype=float)
+        phys = arr[:15]
+        zone_X = {}
+        idx = 15
+        for zi in range(cfg.STAGE2_N_ZONES):
+            zx = {}
+            for sp_z in cfg.STAGE2_SPECIES:
+                zx[sp_z] = float(arr[idx])
+                idx += 1
+            zone_X[zi] = zx
+        return cls(
+            log_L=phys[0], v_inner=phys[1], log_rho_0=phys[2],
+            density_exp=phys[3], T_e_ratio=phys[4], v_core=phys[5],
+            v_wall=phys[6], X_Fe_core=phys[7], X_Si_wall=phys[8],
+            v_break=phys[9], density_exp_outer=phys[10], t_exp=phys[11],
+            X_Fe_wall=phys[12], X_Ni=phys[13], X_Fe_outer=phys[14],
+            zone_X=zone_X,
+        )
+
+
+def _constrain_zone_abundances(arr):
+    """Rescale zone abundances in a 63D array so O filler >= 0.03 in all zones.
+
+    For each zone, the 8 species (Fe, Si, S, Ca, Ni, Mg, Ti, Cr) must sum to
+    <= 0.95 (since C=0.02 is fixed and O_min=0.03 is the filler floor).
+    If the sum exceeds the budget, all 8 species are scaled proportionally.
+    """
+    MAX_SPECIES_SUM = 1.0 - cfg.FIXED_SPECIES_SUM_BASE - 0.03  # 0.95
+    n_species = len(cfg.STAGE2_SPECIES)  # 8
+    for zi in range(cfg.STAGE2_N_ZONES):
+        base = 15 + zi * n_species
+        zone_vals = arr[base:base + n_species]
+        total = zone_vals.sum()
+        if total > MAX_SPECIES_SUM:
+            arr[base:base + n_species] = zone_vals * (MAX_SPECIES_SUM / total)
+    return arr
+
+
+def latin_hypercube(n_samples, param_ranges=None, rng=None, params_class=ModelParams):
+    """Generate Latin Hypercube samples in N-dimensional parameter space.
+
+    Args:
+        n_samples: Number of samples to generate.
+        param_ranges: List of (min, max) tuples. Default: cfg.PARAM_RANGES.
+        rng: numpy random generator.
+        params_class: ModelParams (15D) or Stage2Params (63D).
+
+    Returns list of valid params_class instances.
     """
     if param_ranges is None:
         param_ranges = cfg.PARAM_RANGES
@@ -188,7 +375,8 @@ def latin_hypercube(n_samples, param_ranges=None, rng=None):
         rng = np.random.default_rng(42)
 
     ndim = len(param_ranges)
-    max_attempts = n_samples * 20
+    is_stage2 = (params_class is Stage2Params)
+    max_attempts = n_samples * 50 if is_stage2 else n_samples * 20
 
     # Generate LHS: stratified random sampling
     result = np.zeros((n_samples, ndim))
@@ -204,18 +392,25 @@ def latin_hypercube(n_samples, param_ranges=None, rng=None):
         pmin, pmax = param_ranges[d]
         result[:, d] = pmin + result[:, d] * (pmax - pmin)
 
-    # Convert to ModelParams, rejecting invalid
+    # For Stage 2: constrain zone abundances before validity check
+    if is_stage2:
+        for i in range(n_samples):
+            result[i] = _constrain_zone_abundances(result[i])
+
+    # Convert to params_class, rejecting invalid
     valid = []
     for i in range(n_samples):
-        p = ModelParams.from_array(result[i])
+        p = params_class.from_array(result[i])
         if p.is_valid():
             valid.append(p)
 
     # Fill rejected slots with random valid samples
     attempts = 0
     while len(valid) < n_samples and attempts < max_attempts:
-        vals = [rng.uniform(lo, hi) for lo, hi in param_ranges]
-        p = ModelParams.from_array(vals)
+        vals = np.array([rng.uniform(lo, hi) for lo, hi in param_ranges])
+        if is_stage2:
+            vals = _constrain_zone_abundances(vals)
+        p = params_class.from_array(vals)
         if p.is_valid():
             valid.append(p)
         attempts += 1
@@ -229,7 +424,7 @@ def latin_hypercube(n_samples, param_ranges=None, rng=None):
 class LuminaRunner:
     """Manages LUMINA model execution: directory setup, binary invocation, output parsing."""
 
-    def __init__(self, binary=None, ref_dir=None):
+    def __init__(self, binary=None, ref_dir=None, nlte=False):
         # Auto-detect binary: prefer CUDA, fall back to CPU
         if binary is not None:
             self.binary = Path(binary)
@@ -245,6 +440,7 @@ class LuminaRunner:
 
         self.ref_dir = Path(ref_dir) if ref_dir else cfg.REF_DIR
         self.ref_files = [f.name for f in self.ref_dir.iterdir() if f.is_file()]
+        self.nlte = nlte
 
         cfg.TMPDIR_BASE.mkdir(parents=True, exist_ok=True)
 
@@ -325,24 +521,36 @@ class LuminaRunner:
                 rho = params.density_at_v(v_mid)
                 f.write(f"{i},{rho}\n")
 
-    def _write_abundances_csv(self, dirpath, params: ModelParams):
+    def _write_abundances_csv(self, dirpath, params):
+        """Write per-shell abundances. Dispatches on params type:
+
+        - Stage2Params (has zone_X): 6 zones by shell index (zone_id = shell_id // 5)
+        - ModelParams: 3 zones by velocity (core/wall/outer)
+        """
         v_min = params.v_inner
         dv = (cfg.V_OUTER - v_min) / cfg.N_SHELLS
         abundances = {z: np.zeros(cfg.N_SHELLS) for z in cfg.ELEMENT_ORDER}
 
+        has_zone_X = hasattr(params, 'zone_X') and params.zone_X
+
         for i in range(cfg.N_SHELLS):
-            vi = v_min + i * dv
-            vo = v_min + (i + 1) * dv
-            v_mid = (vi + vo) / 2.0
-
-            if v_mid < params.v_core:
-                zone = 'core'
-            elif v_mid < params.v_wall:
-                zone = 'wall'
+            if has_zone_X:
+                # Stage 2: zone by shell index
+                zone_id = i // 5
+                zone_abund = params.zone_abundances(zone_id)
             else:
-                zone = 'outer'
+                # Stage 1: zone by velocity
+                vi = v_min + i * dv
+                vo = v_min + (i + 1) * dv
+                v_mid = (vi + vo) / 2.0
+                if v_mid < params.v_core:
+                    zone = 'core'
+                elif v_mid < params.v_wall:
+                    zone = 'wall'
+                else:
+                    zone = 'outer'
+                zone_abund = params.zone_abundances(zone)
 
-            zone_abund = params.zone_abundances(zone)
             for z in cfg.ELEMENT_ORDER:
                 abundances[z][i] = zone_abund[z]
 
@@ -381,7 +589,7 @@ class LuminaRunner:
                 T_rad = T_inner * (v_min / v_mid)**0.45
                 f.write(f"{i},{W},{T_rad}\n")
 
-    def run_model(self, params: ModelParams, n_packets: int, n_iters: int,
+    def run_model(self, params, n_packets: int, n_iters: int,
                   tag: str = "", timeout: int = 600,
                   env: dict = None) -> Optional[Tuple[np.ndarray, np.ndarray]]:
         """Run LUMINA and return (wavelength, flux) arrays, or None on failure.
@@ -389,6 +597,7 @@ class LuminaRunner:
         Returns the rotation spectrum (Doppler-weighted observer-frame).
 
         Args:
+            params: ModelParams or Stage2Params instance.
             env: Optional environment dict for subprocess (e.g., CUDA_VISIBLE_DEVICES).
                  If None, inherits parent environment.
         """
@@ -397,10 +606,21 @@ class LuminaRunner:
         work_dir.mkdir(parents=True, exist_ok=True)
 
         try:
+            # Build command: add 'nlte' arg if NLTE enabled
+            cmd = [str(self.binary), str(temp_dir), str(n_packets), str(n_iters), "rotation"]
+            if self.nlte:
+                cmd.append("nlte")
+
+            # Build environment: add LUMINA_NLTE=1 if enabled
+            run_env = env
+            if self.nlte:
+                run_env = (env if env else os.environ).copy()
+                run_env['LUMINA_NLTE'] = '1'
+
             proc = subprocess.run(
-                [str(self.binary), str(temp_dir), str(n_packets), str(n_iters), "rotation"],
+                cmd,
                 capture_output=True, timeout=timeout, cwd=str(work_dir), text=True,
-                env=env,
+                env=run_env,
             )
             if proc.returncode != 0:
                 return None

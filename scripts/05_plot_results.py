@@ -45,30 +45,44 @@ def load_observed():
     return asinh_transform(normalized)
 
 
-def plot_corner(samples, method_name, output_path):
-    """15x15 corner plot of posterior samples."""
+STAGE1_LABELS = [
+    r'$\log L$', r'$v_{\rm inner}$', r'$\log \rho_0$', r'$n_{\rm inner}$',
+    r'$T_e/T_{\rm rad}$', r'$v_{\rm core}$', r'$v_{\rm wall}$',
+    r'$X_{\rm Fe,core}$', r'$X_{\rm Si,wall}$',
+    r'$v_{\rm break}$', r'$n_{\rm outer}$', r'$t_{\rm exp}$',
+    r'$X_{\rm Fe,wall}$', r'$X_{\rm Ni}$', r'$X_{\rm Fe,outer}$',
+]
+
+# For Stage 2: only plot the 15 physical params in corner (63D is too large)
+STAGE2_CORNER_INDICES = list(range(15))  # first 15 params
+
+
+def plot_corner(samples, method_name, output_path, stage=1, param_names=None):
+    """Corner plot of posterior samples. For Stage 2+, only plots physical params."""
     try:
         import corner
     except ImportError:
         print("  corner package not installed, skipping corner plot")
         return
 
-    labels = [
-        r'$\log L$', r'$v_{\rm inner}$', r'$\log \rho_0$', r'$n_{\rm inner}$',
-        r'$T_e/T_{\rm rad}$', r'$v_{\rm core}$', r'$v_{\rm wall}$',
-        r'$X_{\rm Fe,core}$', r'$X_{\rm Si,wall}$',
-        r'$v_{\rm break}$', r'$n_{\rm outer}$', r'$t_{\rm exp}$',
-        r'$X_{\rm Fe,wall}$', r'$X_{\rm Ni}$', r'$X_{\rm Fe,outer}$',
-    ]
+    if stage >= 2:
+        # Plot only the 15 physical params (full 63D corner is too large)
+        plot_samples = samples[:, STAGE2_CORNER_INDICES]
+        labels = STAGE1_LABELS
+        title_suffix = f"({samples.shape[1]}D, showing 15 physical)"
+    else:
+        plot_samples = samples
+        labels = STAGE1_LABELS
+        title_suffix = "(15D)"
 
     fig = corner.corner(
-        samples, labels=labels, show_titles=True,
+        plot_samples, labels=labels, show_titles=True,
         title_kwargs={"fontsize": 8},
         label_kwargs={"fontsize": 9},
         quantiles=[0.16, 0.5, 0.84],
         title_fmt='.3f',
     )
-    fig.suptitle(f'{method_name} Posterior -- SN 2011fe (15D)', fontsize=14, y=1.02)
+    fig.suptitle(f'{method_name} Posterior -- SN 2011fe {title_suffix}', fontsize=14, y=1.02)
     fig.savefig(str(output_path), dpi=80, bbox_inches='tight')
     plt.close(fig)
     print(f"  Saved: {output_path}")
@@ -168,13 +182,18 @@ def plot_spectrum_fit(samples, emulator, obs_spectrum_asinh, method_name, output
     print(f"  Saved: {output_path}")
 
 
-def plot_method_comparison(output_path):
+def plot_method_comparison(output_path, results_dir=None, param_names=None):
     """Compare MCMC vs SBI vs dynesty posteriors."""
+    if results_dir is None:
+        results_dir = cfg.RESULTS_DIR
+    if param_names is None:
+        param_names = cfg.PARAM_NAMES
+
     methods_available = []
     samples_dict = {}
 
     for m in ['mcmc', 'sbi', 'dynesty']:
-        f = cfg.RESULTS_DIR / f"{m}_samples.npy"
+        f = results_dir / f"{m}_samples.npy"
         if f.exists():
             samples_dict[m] = np.load(str(f))
             methods_available.append(m)
@@ -183,26 +202,27 @@ def plot_method_comparison(output_path):
         print("  Need at least 2 methods for comparison, skipping")
         return
 
-    n_params = cfg.N_PARAMS
-    n_rows = (n_params + 3) // 4
+    # For Stage 2+, only plot the 15 physical params
+    n_plot = min(len(param_names), 15)
+    plot_names = param_names[:n_plot]
+
+    n_rows = (n_plot + 3) // 4
     fig, axes = plt.subplots(n_rows, 4, figsize=(20, 3 * n_rows))
     axes_flat = axes.flatten()
     colors = {'mcmc': 'royalblue', 'sbi': 'orangered', 'dynesty': 'forestgreen'}
 
-    for i, name in enumerate(cfg.PARAM_NAMES):
+    for i, name in enumerate(plot_names):
         ax = axes_flat[i]
         for m in methods_available:
             s = samples_dict[m][:, i]
-            lo, hi = cfg.PARAM_RANGES[i]
-            bins = np.linspace(lo, hi, 50)
-            ax.hist(s, bins=bins, alpha=0.4, density=True, color=colors[m], label=m.upper())
+            ax.hist(s, bins=50, alpha=0.4, density=True, color=colors[m], label=m.upper())
         ax.set_xlabel(name, fontsize=9)
         if i == 0:
             ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3)
 
     # Hide unused axes
-    for i in range(n_params, len(axes_flat)):
+    for i in range(n_plot, len(axes_flat)):
         axes_flat[i].set_visible(False)
 
     fig.suptitle('Posterior Comparison: MCMC vs SBI vs Dynesty', fontsize=14)
@@ -212,13 +232,18 @@ def plot_method_comparison(output_path):
     print(f"  Saved: {output_path}")
 
 
-def plot_emulator_diagnostics(output_path):
+def plot_emulator_diagnostics(output_path, data_processed=None, models_dir=None):
     """Plot emulator accuracy per feature window on validation set."""
-    spectra_val = np.load(str(cfg.DATA_PROCESSED / "spectra_val.npy"))
-    params_val = np.load(str(cfg.DATA_PROCESSED / "params_val.npy"))
+    if data_processed is None:
+        data_processed = cfg.DATA_PROCESSED
+    if models_dir is None:
+        models_dir = cfg.MODELS_DIR
+
+    spectra_val = np.load(str(data_processed / "spectra_val.npy"))
+    params_val = np.load(str(data_processed / "params_val.npy"))
 
     from lumina_ml.emulator import Emulator
-    emulator = Emulator.load(cfg.MODELS_DIR, cfg.DATA_PROCESSED)
+    emulator = Emulator.load(models_dir, data_processed)
 
     pred_spectra = emulator.predict_spectrum(params_val)
     grid = cfg.SPECTRUM_GRID
@@ -357,11 +382,21 @@ def plot_emulator_diagnostics(output_path):
 
 def main():
     parser = argparse.ArgumentParser(description="Plot inference results")
+    parser.add_argument('--stage', type=int, default=1, choices=[1, 2, 3],
+                        help='Pipeline stage (default: 1)')
     parser.add_argument('--method', choices=['mcmc', 'sbi', 'dynesty', 'all'],
                         default='all')
     args = parser.parse_args()
 
-    cfg.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    # Stage-specific paths
+    _, data_processed, models_dir, results_dir = cfg.get_stage_paths(args.stage)
+    if args.stage == 2:
+        param_names = cfg.STAGE2_PARAM_NAMES
+    else:
+        param_names = cfg.PARAM_NAMES
+
+    print(f"Stage: {args.stage} ({len(param_names)}D)")
+    results_dir.mkdir(parents=True, exist_ok=True)
     obs_spectrum = load_observed()
 
     methods = [args.method] if args.method != 'all' else ['mcmc', 'sbi', 'dynesty']
@@ -370,39 +405,42 @@ def main():
     emulator = None
     try:
         from lumina_ml.emulator import Emulator
-        emulator = Emulator.load(cfg.MODELS_DIR, cfg.DATA_PROCESSED)
+        emulator = Emulator.load(models_dir, data_processed)
     except Exception as e:
         print(f"  Could not load emulator: {e}")
 
     for method in methods:
-        samples_file = cfg.RESULTS_DIR / f"{method}_samples.npy"
+        samples_file = results_dir / f"{method}_samples.npy"
         if not samples_file.exists():
             print(f"  {method} samples not found, skipping")
             continue
 
         samples = np.load(str(samples_file))
-        print(f"\n{method.upper()} ({len(samples)} samples)")
+        print(f"\n{method.upper()} ({len(samples)} samples, {samples.shape[1]}D)")
 
         # Corner plot
-        plot_corner(samples, method.upper(), cfg.RESULTS_DIR / f"{method}_corner.png")
+        plot_corner(samples, method.upper(), results_dir / f"{method}_corner.png",
+                    stage=args.stage, param_names=param_names)
 
         # Spectrum fit (linear flux)
         if emulator is not None:
             plot_spectrum_fit(
                 samples, emulator, obs_spectrum, method.upper(),
-                cfg.RESULTS_DIR / f"{method}_spectrum_fit.png",
+                results_dir / f"{method}_spectrum_fit.png",
             )
 
     # Comparison plot
-    plot_method_comparison(cfg.RESULTS_DIR / "method_comparison.png")
+    plot_method_comparison(results_dir / "method_comparison.png",
+                           results_dir=results_dir, param_names=param_names)
 
     # Emulator diagnostics
     try:
-        plot_emulator_diagnostics(cfg.RESULTS_DIR / "emulator_diagnostics.png")
+        plot_emulator_diagnostics(results_dir / "emulator_diagnostics.png",
+                                   data_processed=data_processed, models_dir=models_dir)
     except Exception as e:
         print(f"  Emulator diagnostics failed: {e}")
 
-    print("\nAll plots saved to", cfg.RESULTS_DIR)
+    print("\nAll plots saved to", results_dir)
 
 
 if __name__ == '__main__':

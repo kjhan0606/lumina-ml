@@ -24,6 +24,8 @@ from lumina_ml.preprocessing import (
 
 def main():
     parser = argparse.ArgumentParser(description="Preprocess spectra for emulator training")
+    parser.add_argument('--stage', type=int, default=1, choices=[1, 2, 3],
+                        help='Pipeline stage (default: 1)')
     parser.add_argument('--variance', type=float, default=cfg.PCA_VARIANCE_THRESHOLD,
                         help=f'PCA variance threshold (default: {cfg.PCA_VARIANCE_THRESHOLD})')
     parser.add_argument('--val-fraction', type=float, default=0.1,
@@ -32,11 +34,17 @@ def main():
                         help='Random seed for train/val split')
     args = parser.parse_args()
 
+    # Stage-specific paths
+    data_raw, data_processed, _, _ = cfg.get_stage_paths(args.stage)
+    print(f"Stage: {args.stage}")
+    print(f"  Input:  {data_raw}")
+    print(f"  Output: {data_processed}")
+
     # Load raw data
     print("Loading raw data...")
-    params_all = np.load(str(cfg.DATA_RAW / "params_all.npy"))
-    spectra_raw = np.load(str(cfg.DATA_RAW / "spectra_all.npy"))
-    waves_raw = np.load(str(cfg.DATA_RAW / "waves_all.npy"))
+    params_all = np.load(str(data_raw / "params_all.npy"))
+    spectra_raw = np.load(str(data_raw / "spectra_all.npy"))
+    waves_raw = np.load(str(data_raw / "waves_all.npy"))
 
     print(f"  Loaded: {params_all.shape[0]} models, {params_all.shape[1]}D params, "
           f"{spectra_raw.shape[1]} wavelength bins")
@@ -142,21 +150,21 @@ def main():
     print(f"\nSplit: {n_train} train, {n_val} val")
 
     # Save everything
-    cfg.DATA_PROCESSED.mkdir(parents=True, exist_ok=True)
+    data_processed.mkdir(parents=True, exist_ok=True)
 
-    np.save(str(cfg.DATA_PROCESSED / "X_train.npy"), X_train)
-    np.save(str(cfg.DATA_PROCESSED / "X_val.npy"), X_val)
-    np.save(str(cfg.DATA_PROCESSED / "Y_train.npy"), Y_train)
-    np.save(str(cfg.DATA_PROCESSED / "Y_val.npy"), Y_val)
-    np.save(str(cfg.DATA_PROCESSED / "params_train.npy"), params_train)
-    np.save(str(cfg.DATA_PROCESSED / "params_val.npy"), params_val)
-    np.save(str(cfg.DATA_PROCESSED / "spectra_train.npy"), spectra_train)
-    np.save(str(cfg.DATA_PROCESSED / "spectra_val.npy"), spectra_val)
+    np.save(str(data_processed / "X_train.npy"), X_train)
+    np.save(str(data_processed / "X_val.npy"), X_val)
+    np.save(str(data_processed / "Y_train.npy"), Y_train)
+    np.save(str(data_processed / "Y_val.npy"), Y_val)
+    np.save(str(data_processed / "params_train.npy"), params_train)
+    np.save(str(data_processed / "params_val.npy"), params_val)
+    np.save(str(data_processed / "spectra_train.npy"), spectra_train)
+    np.save(str(data_processed / "spectra_val.npy"), spectra_val)
 
-    pca.save(cfg.DATA_PROCESSED / "pca_model.pkl")
-    param_scaler.save(cfg.DATA_PROCESSED / "param_scaler.pkl")
+    pca.save(data_processed / "pca_model.pkl")
+    param_scaler.save(data_processed / "param_scaler.pkl")
 
-    print(f"\nSaved to {cfg.DATA_PROCESSED}/")
+    print(f"\nSaved to {data_processed}/")
     print(f"  X_train:  {X_train.shape}  (normalized params)")
     print(f"  Y_train:  {Y_train.shape}  (standardized PCA coeffs)")
     print(f"  X_val:    {X_val.shape}")

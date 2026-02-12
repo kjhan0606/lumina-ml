@@ -16,11 +16,32 @@ REF_DIR = LUMINA_ROOT / "data" / "tardis_reference"
 OBS_DIR = LUMINA_ROOT / "data" / "sn2011fe"
 OBS_FILE_BMAX = OBS_DIR / "sn2011fe_observed_Bmax.csv"
 
-# Output directories
+# Output directories (Stage 1 defaults)
 DATA_RAW = PROJECT_ROOT / "data" / "raw"
 DATA_PROCESSED = PROJECT_ROOT / "data" / "processed"
 MODELS_DIR = PROJECT_ROOT / "models"
 RESULTS_DIR = PROJECT_ROOT / "results"
+
+# Stage 2 directories
+DATA_RAW_STAGE2 = PROJECT_ROOT / "data" / "raw_stage2"
+DATA_PROCESSED_STAGE2 = PROJECT_ROOT / "data" / "processed_stage2"
+MODELS_STAGE2 = PROJECT_ROOT / "models_stage2"
+RESULTS_STAGE2 = PROJECT_ROOT / "results_stage2"
+
+
+def get_stage_paths(stage):
+    """Return (data_raw, data_processed, models_dir, results_dir) for a given stage."""
+    if stage == 1:
+        return DATA_RAW, DATA_PROCESSED, MODELS_DIR, RESULTS_DIR
+    elif stage == 2:
+        return DATA_RAW_STAGE2, DATA_PROCESSED_STAGE2, MODELS_STAGE2, RESULTS_STAGE2
+    else:
+        # Stage 3+ follows the same naming convention
+        suffix = f"_stage{stage}"
+        return (PROJECT_ROOT / "data" / f"raw{suffix}",
+                PROJECT_ROOT / "data" / f"processed{suffix}",
+                PROJECT_ROOT / f"models{suffix}",
+                PROJECT_ROOT / f"results{suffix}")
 
 # Temporary directory for LUMINA runs
 TMPDIR_BASE = Path("/tmp/lumina_ml")
@@ -68,6 +89,9 @@ PARAM_RANGES = [
 PARAM_RANGES_DICT = dict(zip(PARAM_NAMES, PARAM_RANGES))
 
 N_PARAMS = len(PARAM_NAMES)  # 15
+
+# ===== Stage 2: 63D = 15 physical + 48 zone composition =====
+STAGE2_ZONE_SHELLS = [(0, 5), (5, 10), (10, 15), (15, 20), (20, 25), (25, 30)]
 
 # ===== Fixed abundances (not free parameters) =====
 # Co is now computed from Ni56 decay chain (not fixed)
@@ -190,6 +214,20 @@ STAGE2_ABUNDANCE_RANGES = {
     22: (0.0001, 0.02), # Ti (trace, but strong blue lines)
     24: (0.0001, 0.02), # Cr (trace, Fe-group blend)
 }
+
+# Build Stage 2 parameter names and ranges (63D)
+# First 15: inherited from Stage 1 (ranges relaxed at runtime via relaxed_ranges)
+# Last 48: 6 zones × 8 species
+STAGE2_ZONE_PARAM_NAMES = []
+STAGE2_ZONE_PARAM_RANGES = []
+for _zi in range(STAGE2_N_ZONES):
+    for _sp_z, _sp_name in zip(STAGE2_SPECIES, STAGE2_SPECIES_NAMES):
+        STAGE2_ZONE_PARAM_NAMES.append(f'X_{_sp_name}_z{_zi}')
+        STAGE2_ZONE_PARAM_RANGES.append(STAGE2_ABUNDANCE_RANGES[_sp_z])
+
+STAGE2_PARAM_NAMES = PARAM_NAMES + STAGE2_ZONE_PARAM_NAMES
+STAGE2_PARAM_RANGES = PARAM_RANGES + STAGE2_ZONE_PARAM_RANGES
+STAGE2_N_PARAMS = len(STAGE2_PARAM_NAMES)  # 63
 
 # Stage 3: 15-zone (finer granularity)
 STAGE3_N_ZONES = 15

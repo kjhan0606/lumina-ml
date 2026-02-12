@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """Generate training data for the spectral emulator.
 
-Runs LUMINA models across a 15D Latin Hypercube to produce (params, spectrum) pairs.
+Runs LUMINA models across a Latin Hypercube to produce (params, spectrum) pairs.
 Supports parallel execution via CUDA (multi-GPU), CPU (multi-worker OpenMP), or both.
 
 All workers (GPU and CPU) pull from a single shared work queue for automatic load
 balancing — whichever device finishes first picks up the next model.
 
+Stages:
+  Stage 1: 15D physical parameters
+  Stage 2: 63D = 15 physical (relaxed ±10%) + 48 zone composition (6 zones × 8 species)
+  Stage 3: future (finer granularity)
+
 Usage:
-  python3 scripts/01_generate_training_data.py                          # auto-detect
-  python3 scripts/01_generate_training_data.py --mode both              # all GPUs + CPU
+  python3 scripts/01_generate_training_data.py                          # Stage 1 (default)
+  python3 scripts/01_generate_training_data.py --stage 2 --nlte         # Stage 2 with NLTE
   python3 scripts/01_generate_training_data.py --mode both --n-gpus 2 --n-cpu-workers 3
-  python3 scripts/01_generate_training_data.py --mode cpu --n-cpu-workers 4 --omp-threads 64
   python3 scripts/01_generate_training_data.py --resume                 # Continue from checkpoint
 """
 
@@ -29,7 +33,7 @@ import numpy as np
 # Add parent to path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from lumina_ml import config as cfg
-from lumina_ml.data_utils import LuminaRunner, ModelParams, latin_hypercube
+from lumina_ml.data_utils import LuminaRunner, ModelParams, Stage2Params, latin_hypercube
 
 
 def detect_gpu_count():
@@ -109,8 +113,41 @@ class SharedState:
         return " ".join(parts)
 
 
+def _load_stage1_bestfit(results_dir):
+    """Load Stage 1 best-fit as dict from MCMC/dynesty/SBI samples.
+
+    Uses median of the first available posterior sample file.
+    """
+    results_dir = Path(results_dir)
+    for method in ['mcmc', 'dynesty', 'sbi']:
+        f = results_dir / f"{method}_samples.npy"
+        if f.exists():
+            samples = np.load(str(f))
+            median = np.median(samples, axis=0)
+            return dict(zip(cfg.PARAM_NAMES, median))
+
+    # Fallback: try params_all.npy (center of training data)
+    f = results_dir.parent / "data" / "raw" / "params_all.npy"
+    if f.exists():
+        params = np.load(str(f))
+        # Use mean of valid models
+        median = np.median(params, axis=0)
+        return dict(zip(cfg.PARAM_NAMES, median))
+
+    raise FileNotFoundError(
+        f"No Stage 1 results found in {results_dir}. "
+        f"Run Stage 1 first, or provide --stage1-results DIR."
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate LUMINA training data")
+    parser.add_argument('--stage', type=int, default=1, choices=[1, 2, 3],
+                        help='Pipeline stage (default: 1)')
+    parser.add_argument('--nlte', action='store_true',
+                        help='Enable NLTE rate equations in LUMINA')
+    parser.add_argument('--stage1-results', type=str, default=None,
+                        help='Directory with Stage 1 results (for Stage 2 relaxation)')
     parser.add_argument('--n-models', type=int, default=cfg.DEFAULT_N_MODELS,
                         help=f'Number of models (default: {cfg.DEFAULT_N_MODELS})')
     parser.add_argument('--n-packets', type=int, default=cfg.DEFAULT_N_PACKETS,
@@ -163,24 +200,52 @@ def main():
     # Compute OMP threads per CPU worker
     threads_per_cpu = max(1, args.omp_threads // args.n_cpu_workers)
 
+    print(f"Stage: {args.stage}")
     print(f"Mode: {args.mode}")
+    print(f"NLTE: {'ENABLED' if args.nlte else 'disabled'}")
     print(f"Models: {args.n_models}, Packets: {args.n_packets}, Iters: {args.n_iters}")
     if args.mode in ('both', 'cuda'):
         print(f"GPUs: {args.n_gpus} (detected: {n_gpus_available})")
     if args.mode in ('both', 'cpu'):
         print(f"CPU workers: {args.n_cpu_workers}, OMP threads/worker: {threads_per_cpu}")
 
+    # Stage-specific setup
+    data_raw, _, _, results_dir = cfg.get_stage_paths(args.stage)
+
+    if args.stage == 1:
+        params_class = ModelParams
+        param_ranges = cfg.PARAM_RANGES
+        n_params = cfg.N_PARAMS
+    elif args.stage == 2:
+        params_class = Stage2Params
+        # Load Stage 1 best-fit for relaxation
+        stage1_results_dir = Path(args.stage1_results) if args.stage1_results else cfg.RESULTS_DIR
+        best_fit = _load_stage1_bestfit(stage1_results_dir)
+        print(f"\nStage 1 best-fit loaded from {stage1_results_dir}:")
+        for k, v in best_fit.items():
+            print(f"  {k}: {v:.4f}")
+        # Relax first 15 params ±10%, keep full range for 48 zone params
+        relaxed_15 = cfg.relaxed_ranges(best_fit, cfg.PARAM_NAMES, cfg.PARAM_RANGES)
+        param_ranges = relaxed_15 + cfg.STAGE2_ZONE_PARAM_RANGES
+        n_params = cfg.STAGE2_N_PARAMS
+        print(f"\n  Relaxed 15D ranges (±10% around best-fit):")
+        for name, (lo, hi) in zip(cfg.PARAM_NAMES, relaxed_15):
+            print(f"    {name:22s}: [{lo:.4f}, {hi:.4f}]")
+    else:
+        raise ValueError(f"Stage {args.stage} not yet implemented")
+
     # Output paths
-    cfg.DATA_RAW.mkdir(parents=True, exist_ok=True)
-    params_file = cfg.DATA_RAW / "params_all.npy"
-    spectra_file = cfg.DATA_RAW / "spectra_all.npy"
-    waves_file = cfg.DATA_RAW / "waves_all.npy"
-    checkpoint_file = cfg.DATA_RAW / "checkpoint.npz"
+    data_raw.mkdir(parents=True, exist_ok=True)
+    params_file = data_raw / "params_all.npy"
+    spectra_file = data_raw / "spectra_all.npy"
+    waves_file = data_raw / "waves_all.npy"
+    checkpoint_file = data_raw / "checkpoint.npz"
 
     # Generate LHS samples
-    print(f"\nGenerating {args.n_models} Latin Hypercube samples in {cfg.N_PARAMS}D...")
+    print(f"\nGenerating {args.n_models} Latin Hypercube samples in {n_params}D...")
     rng = np.random.default_rng(args.seed)
-    all_params = latin_hypercube(args.n_models, rng=rng)
+    all_params = latin_hypercube(args.n_models, param_ranges=param_ranges,
+                                 rng=rng, params_class=params_class)
     print(f"  Valid samples: {len(all_params)}")
 
     params_array = np.array([p.to_array() for p in all_params])
@@ -258,7 +323,7 @@ def main():
     # GPU workers
     if use_cuda:
         n_gpu_workers = args.n_gpus
-        cuda_runner = LuminaRunner(binary=cfg.LUMINA_CUDA)
+        cuda_runner = LuminaRunner(binary=cfg.LUMINA_CUDA, nlte=args.nlte)
         for gpu_id in range(n_gpu_workers):
             env = make_gpu_env(gpu_id)
             label = f"GPU{gpu_id}" if n_gpu_workers > 1 else "CUDA"
@@ -269,7 +334,7 @@ def main():
 
     # CPU workers
     if use_cpu:
-        cpu_runner = LuminaRunner(binary=cfg.LUMINA_CPU)
+        cpu_runner = LuminaRunner(binary=cfg.LUMINA_CPU, nlte=args.nlte)
         for cpu_id in range(args.n_cpu_workers):
             env = make_cpu_env(threads_per_cpu)
             label = f"CPU{cpu_id}" if args.n_cpu_workers > 1 else "CPU"

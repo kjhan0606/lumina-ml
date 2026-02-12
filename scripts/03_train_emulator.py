@@ -22,6 +22,8 @@ from lumina_ml.preprocessing import SpectralPCA, asinh_inverse, measure_spectral
 
 def main():
     parser = argparse.ArgumentParser(description="Train the spectral emulator")
+    parser.add_argument('--stage', type=int, default=1, choices=[1, 2, 3],
+                        help='Pipeline stage (default: 1)')
     parser.add_argument('--epochs', type=int, default=cfg.NN_MAX_EPOCHS)
     parser.add_argument('--batch-size', type=int, default=cfg.NN_BATCH_SIZE)
     parser.add_argument('--lr', type=float, default=cfg.NN_LEARNING_RATE)
@@ -31,23 +33,29 @@ def main():
                         help='Disable feature-weighted loss (use simple MSE)')
     args = parser.parse_args()
 
+    # Stage-specific paths
+    _, data_processed, models_dir, _ = cfg.get_stage_paths(args.stage)
+    n_params = cfg.STAGE2_N_PARAMS if args.stage == 2 else cfg.N_PARAMS
+    print(f"Stage: {args.stage} ({n_params}D)")
+
     # Load preprocessed data
     print("Loading preprocessed data...")
-    X_train = np.load(str(cfg.DATA_PROCESSED / "X_train.npy"))
-    X_val = np.load(str(cfg.DATA_PROCESSED / "X_val.npy"))
-    Y_train = np.load(str(cfg.DATA_PROCESSED / "Y_train.npy"))
-    Y_val = np.load(str(cfg.DATA_PROCESSED / "Y_val.npy"))
+    X_train = np.load(str(data_processed / "X_train.npy"))
+    X_val = np.load(str(data_processed / "X_val.npy"))
+    Y_train = np.load(str(data_processed / "Y_train.npy"))
+    Y_val = np.load(str(data_processed / "Y_val.npy"))
 
     n_pca = Y_train.shape[1]
+    n_input = X_train.shape[1]
     print(f"  Train: {X_train.shape[0]} samples")
     print(f"  Val:   {X_val.shape[0]} samples")
-    print(f"  Input dim: {cfg.N_PARAMS}, Output dim (PCA): {n_pca}")
+    print(f"  Input dim: {n_input}, Output dim (PCA): {n_pca}")
 
     # Load PCA model for feature-weighted loss
-    pca = SpectralPCA.load(cfg.DATA_PROCESSED / "pca_model.pkl")
+    pca = SpectralPCA.load(data_processed / "pca_model.pkl")
 
     # Create model
-    model = SpectralMLP(n_input=cfg.N_PARAMS, n_output=n_pca)
+    model = SpectralMLP(n_input=n_input, n_output=n_pca)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"\nModel: {n_params:,} parameters")
     print(f"  Hidden layers: {cfg.NN_HIDDEN_LAYERS}")
@@ -83,8 +91,8 @@ def main():
     )
 
     # Save model
-    cfg.MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    model_path = cfg.MODELS_DIR / "emulator.pt"
+    models_dir.mkdir(parents=True, exist_ok=True)
+    model_path = models_dir / "emulator.pt"
     trainer.save(model_path)
     print(f"\nModel saved to {model_path}")
 
@@ -101,7 +109,7 @@ def main():
     print(f"  PCA MSE (standardized): {mse_pca:.6f}")
 
     # Spectrum-space error (asinh)
-    spectra_val = np.load(str(cfg.DATA_PROCESSED / "spectra_val.npy"))
+    spectra_val = np.load(str(data_processed / "spectra_val.npy"))
     spectra_pred = pca.inverse_transform(pred)
     rms_per_spec = np.sqrt(np.mean((spectra_pred - spectra_val)**2, axis=1))
     print(f"  Spectrum RMS (asinh): mean={rms_per_spec.mean():.4f}, "
@@ -147,7 +155,7 @@ def main():
           f"max={np.max(depth_errs):.4f}")
 
     # Save training history
-    np.savez(str(cfg.MODELS_DIR / "training_history.npz"), **history)
+    np.savez(str(models_dir / "training_history.npz"), **history)
 
     # Plot training curves
     try:
@@ -197,7 +205,7 @@ def main():
         ax.grid(True, alpha=0.3)
 
         plt.tight_layout()
-        fig_path = cfg.MODELS_DIR / "training_curves.png"
+        fig_path = models_dir / "training_curves.png"
         plt.savefig(str(fig_path), dpi=150)
         print(f"\n  Training curves saved to {fig_path}")
         plt.close()
