@@ -80,6 +80,7 @@ class SharedState:
         self.n_total = n_total
         # Per-device counters: key = device label, value = count
         self.device_counts = {}
+        self.last_checkpoint = 0  # track last checkpoint to avoid race condition
         # Shared work queue: all remaining models
         self.work_queue = queue.Queue()
         for idx in remaining_indices:
@@ -146,6 +147,8 @@ def main():
                         help='Pipeline stage (default: 1)')
     parser.add_argument('--nlte', action='store_true',
                         help='Enable NLTE rate equations in LUMINA')
+    parser.add_argument('--nlte-start-iter', type=int, default=0,
+                        help='Start NLTE from this iteration (0=all iters, 7=last 3 of 10)')
     parser.add_argument('--stage1-results', type=str, default=None,
                         help='Directory with Stage 1 results (for Stage 2 relaxation)')
     parser.add_argument('--n-models', type=int, default=cfg.DEFAULT_N_MODELS,
@@ -164,6 +167,8 @@ def main():
                         help='Total OMP threads for CPU, divided among workers (default: 64)')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed for LHS (default: 42)')
+    parser.add_argument('--refine-from', type=str, default=None,
+                        help='Refine ranges from SBI posterior (path to results dir with sbi_samples.npy)')
     parser.add_argument('--resume', action='store_true',
                         help='Resume from last checkpoint')
     args = parser.parse_args()
@@ -224,13 +229,29 @@ def main():
         print(f"\nStage 1 best-fit loaded from {stage1_results_dir}:")
         for k, v in best_fit.items():
             print(f"  {k}: {v:.4f}")
-        # Relax first 15 params ±10%, keep full range for 48 zone params
-        relaxed_15 = cfg.relaxed_ranges(best_fit, cfg.PARAM_NAMES, cfg.PARAM_RANGES)
-        param_ranges = relaxed_15 + cfg.STAGE2_ZONE_PARAM_RANGES
+
+        if args.refine_from:
+            # Load SBI posterior from previous Stage 2 run
+            sbi_file = Path(args.refine_from) / "sbi_samples.npy"
+            sbi_samples = np.load(str(sbi_file))
+            param_ranges = cfg.posterior_ranges(
+                sbi_samples, cfg.STAGE2_PARAM_NAMES, cfg.STAGE2_PARAM_RANGES,
+                percentile_lo=1, percentile_hi=99, margin=0.30
+            )
+            print(f"\n  Refined ranges from SBI posterior ({len(sbi_samples)} samples):")
+            for name, (lo, hi) in zip(cfg.STAGE2_PARAM_NAMES[:15], param_ranges[:15]):
+                old_lo, old_hi = cfg.STAGE2_PARAM_RANGES[cfg.STAGE2_PARAM_NAMES.index(name)]
+                compress = (old_hi - old_lo) / max(1e-10, hi - lo)
+                print(f"    {name:22s}: [{lo:.4f}, {hi:.4f}]  ({compress:.1f}x)")
+        else:
+            # Original Stage 2: relax 15D ±10%, full zone ranges
+            relaxed_15 = cfg.relaxed_ranges(best_fit, cfg.PARAM_NAMES, cfg.PARAM_RANGES)
+            param_ranges = relaxed_15 + cfg.STAGE2_ZONE_PARAM_RANGES
+            print(f"\n  Relaxed 15D ranges (±10% around best-fit):")
+            for name, (lo, hi) in zip(cfg.PARAM_NAMES, relaxed_15):
+                print(f"    {name:22s}: [{lo:.4f}, {hi:.4f}]")
+
         n_params = cfg.STAGE2_N_PARAMS
-        print(f"\n  Relaxed 15D ranges (±10% around best-fit):")
-        for name, (lo, hi) in zip(cfg.PARAM_NAMES, relaxed_15):
-            print(f"    {name:22s}: [{lo:.4f}, {hi:.4f}]")
     else:
         raise ValueError(f"Stage {args.stage} not yet implemented")
 
@@ -298,7 +319,8 @@ def main():
             # Checkpoint (use lock to avoid concurrent writes)
             with state.lock:
                 total_done = state.n_success + state.n_fail - len(completed_indices)
-                if total_done > 0 and total_done % cfg.BATCH_SAVE_INTERVAL == 0:
+                if total_done > 0 and total_done >= state.last_checkpoint + cfg.BATCH_SAVE_INTERVAL:
+                    state.last_checkpoint = total_done
                     _save_checkpoint(params_array, state.spectra_dict,
                                      state.completed_indices,
                                      params_file, spectra_file,
@@ -323,7 +345,8 @@ def main():
     # GPU workers
     if use_cuda:
         n_gpu_workers = args.n_gpus
-        cuda_runner = LuminaRunner(binary=cfg.LUMINA_CUDA, nlte=args.nlte)
+        cuda_runner = LuminaRunner(binary=cfg.LUMINA_CUDA, nlte=args.nlte,
+                                   nlte_start_iter=args.nlte_start_iter)
         for gpu_id in range(n_gpu_workers):
             env = make_gpu_env(gpu_id)
             label = f"GPU{gpu_id}" if n_gpu_workers > 1 else "CUDA"
@@ -334,7 +357,8 @@ def main():
 
     # CPU workers
     if use_cpu:
-        cpu_runner = LuminaRunner(binary=cfg.LUMINA_CPU, nlte=args.nlte)
+        cpu_runner = LuminaRunner(binary=cfg.LUMINA_CPU, nlte=args.nlte,
+                                  nlte_start_iter=args.nlte_start_iter)
         for cpu_id in range(args.n_cpu_workers):
             env = make_cpu_env(threads_per_cpu)
             label = f"CPU{cpu_id}" if args.n_cpu_workers > 1 else "CPU"

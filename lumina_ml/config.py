@@ -275,3 +275,24 @@ def relaxed_ranges(best_fit, param_names, param_ranges, margin=RELAXATION_MARGIN
             # New parameter: use full prior range
             relaxed.append((full_lo, full_hi))
     return relaxed
+
+
+def posterior_ranges(samples, param_names, param_ranges,
+                     percentile_lo=1, percentile_hi=99, margin=0.30):
+    """Narrow parameter ranges based on posterior samples.
+
+    Uses [percentile_lo, percentile_hi] of samples + margin on each side,
+    clamped to original prior bounds.
+    """
+    narrowed = []
+    for i, (name, (full_lo, full_hi)) in enumerate(zip(param_names, param_ranges)):
+        p_lo = np.percentile(samples[:, i], percentile_lo)
+        p_hi = np.percentile(samples[:, i], percentile_hi)
+        width = p_hi - p_lo
+        delta = width * margin
+        lo = max(full_lo, p_lo - delta)
+        hi = min(full_hi, p_hi + delta)
+        if hi <= lo:
+            lo, hi = full_lo, full_hi  # fallback to full range
+        narrowed.append((lo, hi))
+    return narrowed
