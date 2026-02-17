@@ -270,6 +270,12 @@ def run_mcmc(likelihood,
         param_ranges = cfg.PARAM_RANGES
     ndim = n_params if n_params is not None else len(param_ranges)
 
+    # emcee requires n_walkers >= 2 * ndim
+    if n_walkers < 2 * ndim:
+        n_walkers = 2 * ndim + 2
+        if verbose:
+            print(f"  Adjusted n_walkers to {n_walkers} (>= 2*ndim={2*ndim})")
+
     if initial_guess is None:
         initial_guess = np.array([(lo + hi) / 2 for lo, hi in param_ranges])
 
@@ -413,6 +419,7 @@ def run_sbi(training_params: np.ndarray, training_spectra: np.ndarray,
             obs_spectrum: np.ndarray,
             n_posterior_samples: int = 10000,
             param_ranges: list = None,
+            compute_log_prob: bool = False,
             verbose: bool = True) -> dict:
     """Run Simulation-Based Inference using Neural Posterior Estimation (NPE)."""
     import torch
@@ -453,15 +460,20 @@ def run_sbi(training_params: np.ndarray, training_spectra: np.ndarray,
     if verbose:
         print(f"  Drawing {n_posterior_samples} posterior samples...")
     samples = posterior.sample((n_posterior_samples,), x=obs_tensor)
-    log_prob = posterior.log_prob(samples, x=obs_tensor)
-
     samples_np = samples.numpy()
-    log_prob_np = log_prob.numpy()
 
-    if verbose:
-        best_idx = np.argmax(log_prob_np)
-        print(f"  Best log-prob: {log_prob_np[best_idx]:.2f}")
-        print(f"  Best params: {samples_np[best_idx]}")
+    # log_prob is very slow in high-D (>30D); skip by default
+    log_prob_np = np.zeros(len(samples_np))
+    if compute_log_prob:
+        if verbose:
+            print(f"  Computing log_prob (may be slow in {ndim}D)...")
+        log_prob = posterior.log_prob(samples, x=obs_tensor)
+        log_prob_np = log_prob.numpy()
+        if verbose:
+            best_idx = np.argmax(log_prob_np)
+            print(f"  Best log-prob: {log_prob_np[best_idx]:.2f}")
+    elif verbose:
+        print(f"  Skipping log_prob (slow in {ndim}D); using samples only")
 
     return {
         'samples': samples_np,

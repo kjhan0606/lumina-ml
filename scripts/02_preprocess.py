@@ -123,7 +123,13 @@ def main():
           f"max={rms_linear.max():.6f}")
 
     # Normalize parameters to [0, 1]
-    param_scaler = ParamScaler()
+    if args.stage == 2:
+        param_ranges = cfg.STAGE2_PARAM_RANGES
+    elif args.stage == 3:
+        param_ranges = cfg.STAGE3_PARAM_RANGES if hasattr(cfg, 'STAGE3_PARAM_RANGES') else cfg.PARAM_RANGES
+    else:
+        param_ranges = cfg.PARAM_RANGES
+    param_scaler = ParamScaler(param_ranges=param_ranges)
     params_norm = param_scaler.transform(params_valid)
 
     # Train/val split

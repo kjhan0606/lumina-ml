@@ -424,7 +424,7 @@ def latin_hypercube(n_samples, param_ranges=None, rng=None, params_class=ModelPa
 class LuminaRunner:
     """Manages LUMINA model execution: directory setup, binary invocation, output parsing."""
 
-    def __init__(self, binary=None, ref_dir=None, nlte=False):
+    def __init__(self, binary=None, ref_dir=None, nlte=False, nlte_start_iter=0):
         # Auto-detect binary: prefer CUDA, fall back to CPU
         if binary is not None:
             self.binary = Path(binary)
@@ -441,6 +441,7 @@ class LuminaRunner:
         self.ref_dir = Path(ref_dir) if ref_dir else cfg.REF_DIR
         self.ref_files = [f.name for f in self.ref_dir.iterdir() if f.is_file()]
         self.nlte = nlte
+        self.nlte_start_iter = nlte_start_iter
 
         cfg.TMPDIR_BASE.mkdir(parents=True, exist_ok=True)
 
@@ -616,6 +617,8 @@ class LuminaRunner:
             if self.nlte:
                 run_env = (env if env else os.environ).copy()
                 run_env['LUMINA_NLTE'] = '1'
+                if self.nlte_start_iter > 0:
+                    run_env['LUMINA_NLTE_START_ITER'] = str(self.nlte_start_iter)
 
             proc = subprocess.run(
                 cmd,
